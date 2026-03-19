@@ -323,7 +323,7 @@ function handleChatCompletion(
   if (activeBridge && toolResults.length > 0) {
     // Resume an existing bridge with tool results
     activeBridges.delete(bridgeKey);
-    return handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken);
+    return handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken, bridgeKey);
   }
 
   // Clean up stale bridge if present
@@ -1044,6 +1044,7 @@ function handleToolResultResume(
   modelId: string,
   tools: OpenAIToolDef[],
   accessToken: string,
+  bridgeKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
@@ -1094,14 +1095,10 @@ function handleToolResultResume(
     );
   }
 
-  // Now stream the continuation response
+  // Now stream the continuation response.
+  // Reuse the same bridgeKey so subsequent tool calls can be found by deriveBridgeKey().
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const bridgeKey = createHash("sha256")
-    .update(`resume-${completionId}`)
-    .digest("hex")
-    .slice(0, 16);
-
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
