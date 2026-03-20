@@ -115,6 +115,11 @@ interface ChatCompletionRequest {
   tool_choice?: unknown;
 }
 
+interface ProxyModelInfo {
+  id: string;
+  name: string;
+}
+
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
@@ -298,7 +303,7 @@ export async function callCursorUnaryRpc(
     });
   });
 
-  bridge.write(options.requestBody);
+  bridge.write(frameConnectMessage(options.requestBody));
   bridge.end();
 
   return promise;
@@ -307,6 +312,21 @@ export async function callCursorUnaryRpc(
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+let proxyModels: ProxyModelInfo[] = [];
+
+function buildOpenAIModelList(models: ReadonlyArray<ProxyModelInfo>): Array<{
+  id: string;
+  object: "model";
+  created: number;
+  owned_by: string;
+}> {
+  return models.map((model) => ({
+    id: model.id,
+    object: "model",
+    created: 0,
+    owned_by: "cursor",
+  }));
+}
 
 export function getProxyPort(): number | undefined {
   return proxyPort;
@@ -314,8 +334,13 @@ export function getProxyPort(): number | undefined {
 
 export async function startProxy(
   getAccessToken: () => Promise<string>,
+  models: ReadonlyArray<ProxyModelInfo> = [],
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
+  proxyModels = models.map((model) => ({
+    id: model.id,
+    name: model.name,
+  }));
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
@@ -326,7 +351,10 @@ export async function startProxy(
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         return new Response(
-          JSON.stringify({ object: "list", data: [] }),
+          JSON.stringify({
+            object: "list",
+            data: buildOpenAIModelList(proxyModels),
+          }),
           { headers: { "Content-Type": "application/json" } },
         );
       }
@@ -365,6 +393,7 @@ export function stopProxy(): void {
     proxyServer = undefined;
     proxyPort = undefined;
     proxyAccessTokenProvider = undefined;
+    proxyModels = [];
   }
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {

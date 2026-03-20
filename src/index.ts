@@ -59,7 +59,7 @@ export const CursorAuthPlugin: Plugin = async (
 
         const accessToken = await getValidAccessToken();
         const modelCatalog = await loadCursorModelCatalog({ apiKey: accessToken });
-        const port = await startProxy(getValidAccessToken);
+        const port = await startProxy(getValidAccessToken, modelCatalog.models);
 
         reportModelDiscovery(modelCatalog);
 

@@ -27,6 +27,7 @@ interface TestCursorBackend {
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
+  getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
   close: () => Promise<void>;
 }
@@ -59,12 +60,21 @@ function makeJwt(expiresAtSeconds: number): string {
   return `${header}.${payload}.fakesig`;
 }
 
+function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = 0;
+  frame.writeUInt32BE(payload.length, 1);
+  frame.set(payload, 5);
+  return frame;
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
   const discoveryAuthHeaders: string[] = [];
+  const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
 
   const refreshServer = http.createServer((req, res) => {
@@ -115,6 +125,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     stream.on("end", () => {
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
+        discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
         if (discoveryMode === "auth-error") {
           stream.respond({
@@ -128,8 +139,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         }
 
         const responseBody = discoveryMode === "empty"
-          ? Buffer.from([0, 0, 0, 0, 0])
-          : Buffer.from(
+          ? frameConnectUnaryMessage(new Uint8Array())
+          : frameConnectUnaryMessage(
               toBinary(
                 GetUsableModelsResponseSchema,
                 create(GetUsableModelsResponseSchema, {
@@ -171,10 +182,14 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
+      discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
+    },
+    getDiscoveryRequestBodies() {
+      return discoveryRequestBodies.map((body) => new Uint8Array(body));
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
@@ -228,6 +243,9 @@ async function testProxyStartStop(modules: TestModules) {
   const modelsBody = await modelsRes.json();
   if (modelsBody.object !== "list") {
     throw new Error(`Expected object=list, got ${modelsBody.object}`);
+  }
+  if (!Array.isArray(modelsBody.data) || modelsBody.data.length !== 0) {
+    throw new Error(`Expected empty model list data array, got ${JSON.stringify(modelsBody.data)}`);
   }
   console.log("[test] /v1/models OK");
 
@@ -428,6 +446,11 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
   assertArrayEqual(
+    backend.getDiscoveryRequestBodies().map((body) => Buffer.from(body).toString("hex")),
+    ["0000000000"],
+    "Expected discovery to send an empty Connect unary frame",
+  );
+  assertArrayEqual(
     Object.keys(provider.models),
     ["fresh-model"],
     "Expected provider models to come from successful discovery",
@@ -472,6 +495,21 @@ async function testDiscoveryDegradedModes(
     "Expected transport failure issue code",
   );
 
+  backend.setDiscoveryMode("auth-error");
+  const authCatalog = await modules.loadCursorModelCatalog({
+    apiKey: "expired-access",
+    baseUrl: backend.apiUrl,
+    timeoutMs: 500,
+  });
+  assertEqual(authCatalog.source, "fallback", "Expected auth failure to use fallback catalog");
+  assertEqual(authCatalog.degraded, true, "Expected auth failure to be marked degraded");
+  assertEqual(authCatalog.diagnostics.status, "failed", "Expected auth failure status");
+  assertEqual(
+    authCatalog.diagnostics.issues[0]?.code,
+    "auth",
+    "Expected auth failure issue code",
+  );
+
   console.log("[test] Degraded discovery modes OK");
 }
 
@@ -495,13 +533,21 @@ async function testSuccessfulDiscoveryReplacesFallbackState(
     },
   } as any);
   const provider = { models: { stale: { id: "stale" } } } as any;
-
   backend.setDiscoveryMode("empty");
-  await hooks.auth!.loader(async () => authState, provider);
+
+  const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
   assertArrayEqual(
     Object.keys(provider.models).sort(),
     modules.CURSOR_FALLBACK_MODELS.map((model) => model.id).sort(),
     "Expected first degraded load to register the fallback catalog only",
+  );
+  const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
+  assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models request to succeed");
+  const degradedModelsBody = await degradedModelsRes.json();
+  assertArrayEqual(
+    degradedModelsBody.data.map((model: { id: string }) => model.id).sort(),
+    modules.CURSOR_FALLBACK_MODELS.map((model) => model.id).sort(),
+    "Expected proxy /v1/models to expose the degraded fallback catalog",
   );
 
   backend.setDiscoveryMode("success");
@@ -509,11 +555,19 @@ async function testSuccessfulDiscoveryReplacesFallbackState(
     { id: "real-model-a", name: "Real Model A" },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
-  await hooks.auth!.loader(async () => authState, provider);
+  const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
   assertArrayEqual(
     Object.keys(provider.models).sort(),
     ["real-model-a", "real-model-b"],
     "Expected successful discovery to replace stale fallback models",
+  );
+  const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
+  assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models request to succeed");
+  const discoveredModelsBody = await discoveredModelsRes.json();
+  assertArrayEqual(
+    discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
+    ["real-model-a", "real-model-b"],
+    "Expected proxy /v1/models to expose the discovered model catalog",
   );
 
   modules.stopProxy();
