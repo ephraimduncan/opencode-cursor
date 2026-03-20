@@ -1,7 +1,7 @@
 /**
  * Cursor model discovery via GetUsableModels gRPC endpoint.
- * Uses curl for HTTP/2 transport (Bun's node:http2 is broken).
- * Falls back to a hardcoded list if the endpoint is unreachable.
+ * Uses Node.js http2 module (primary) with curl --http2 as fallback.
+ * Falls back to a hardcoded list if neither transport works.
  */
 import { execSync } from "node:child_process";
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
@@ -54,11 +54,20 @@ export interface CursorModel {
 
 const FALLBACK_MODELS: CursorModel[] = [
   { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4-sonnet", name: "Claude 4 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-3.5-sonnet", name: "Claude 3.5 Sonnet", reasoning: false, contextWindow: 200_000, maxTokens: 8_192 },
-  { id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128_000, maxTokens: 16_384 },
-  { id: "cursor-small", name: "Cursor Small", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "claude-4.6-sonnet-medium", name: "Sonnet 4.6 1M", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-sonnet-medium-thinking", name: "Sonnet 4.6 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus-high", name: "Opus 4.6 1M", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus-high-thinking", name: "Opus 4.6 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet", name: "Sonnet 4.5 1M", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet-thinking", name: "Sonnet 4.5 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet", name: "Sonnet 4", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet-thinking", name: "Sonnet 4 Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-medium", name: "GPT-5.4 1M", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.2", name: "GPT-5.2", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "gemini-3-pro", name: "Gemini 3 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "grok-4-20", name: "Grok 4.20", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "grok-4-20-thinking", name: "Grok 4.20 Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
 ];
 
 export interface CursorModelDiscoveryOptions {
@@ -116,10 +125,92 @@ function buildRequestHeaders(
 }
 
 /**
- * HTTP/2 transport via curl (Bun's node:http2 doesn't work with Cursor's API).
- * Writes request body to a temp file, invokes curl --http2, reads response.
+ * HTTP/2 transport: curl --http2 on macOS/Linux, Node.js subprocess on Windows.
+ * Windows curl typically lacks HTTP/2 support, so we skip it entirely there.
+ * Bun's node:http2 polyfill is broken, so the Node path spawns a real process.
  */
 async function fetchViaHttp2(
+  baseUrl: string,
+  body: Uint8Array,
+  options: CursorModelDiscoveryOptions,
+  timeoutMs: number,
+): Promise<Uint8Array | null> {
+  if (process.platform === "win32") {
+    return fetchViaNodeSubprocess(baseUrl, body, options, timeoutMs);
+  }
+  return fetchViaCurl(baseUrl, body, options, timeoutMs);
+}
+
+/**
+ * HTTP/2 transport by spawning a Node.js subprocess.
+ * Bun's node:http2 is broken, so we use real Node for HTTP/2.
+ * Writes a temp .cjs script to avoid shell escaping issues on Windows.
+ */
+async function fetchViaNodeSubprocess(
+  baseUrl: string,
+  body: Uint8Array,
+  options: CursorModelDiscoveryOptions,
+  timeoutMs: number,
+): Promise<Uint8Array | null> {
+  const headers = buildRequestHeaders(options);
+  const ts = Date.now();
+  const reqPath = join(tmpdir(), `cursor-req-${ts}.bin`);
+  const respPath = join(tmpdir(), `cursor-resp-${ts}.bin`);
+  const scriptPath = join(tmpdir(), `cursor-h2-${ts}.cjs`);
+
+  try {
+    writeFileSync(reqPath, body);
+
+    // Build a self-contained Node.js CJS script that does the HTTP/2 request.
+    // Use forward slashes in paths for cross-platform compatibility.
+    const fwdReqPath = reqPath.split("\\").join("/");
+    const fwdRespPath = respPath.split("\\").join("/");
+    const headerEntries = Object.entries(headers)
+      .map(([k, v]) => `${JSON.stringify(k)}:${JSON.stringify(v)}`)
+      .join(",");
+
+    const script = `"use strict";
+const http2=require("http2"),fs=require("fs");
+const body=fs.readFileSync(${JSON.stringify(fwdReqPath)});
+const c=http2.connect(${JSON.stringify(baseUrl)});
+let timer=setTimeout(()=>{c.close();process.exit(1)},${timeoutMs});
+c.on("error",()=>{clearTimeout(timer);process.exit(1)});
+const r=c.request({":method":"POST",":path":${JSON.stringify(GET_USABLE_MODELS_PATH)},${headerEntries}});
+r.end(body);const ch=[];let st;
+r.on("response",(h)=>{st=h[":status"]});
+r.on("data",(d)=>ch.push(d));
+r.on("end",()=>{clearTimeout(timer);c.close();
+const d=Buffer.concat(ch);
+if(st>=200&&st<300&&d.length>0){fs.writeFileSync(${JSON.stringify(fwdRespPath)},d);process.exit(0)}
+else process.exit(1)});
+r.on("error",()=>{clearTimeout(timer);c.close();process.exit(1)});`;
+
+    writeFileSync(scriptPath, script);
+
+    try {
+      execSync(`node ${scriptPath}`, {
+        timeout: timeoutMs + 3000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      // Check if the response was written despite non-zero exit
+    }
+
+    if (!existsSync(respPath)) return null;
+    return new Uint8Array(readFileSync(respPath));
+  } catch {
+    return null;
+  } finally {
+    try { unlinkSync(reqPath); } catch {}
+    try { unlinkSync(respPath); } catch {}
+    try { unlinkSync(scriptPath); } catch {}
+  }
+}
+
+/**
+ * HTTP/2 transport via curl (fallback for environments where Node subprocess fails).
+ */
+async function fetchViaCurl(
   baseUrl: string,
   body: Uint8Array,
   options: CursorModelDiscoveryOptions,
