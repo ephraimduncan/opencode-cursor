@@ -149,4 +149,8 @@ h2Stream.on("error", () => {
       h2Stream.write(msg);
     }
   }
+
+  if (!h2Stream.closed && !h2Stream.destroyed) {
+    h2Stream.end();
+  }
 })();

@@ -1,8 +1,9 @@
 import { generatePKCE } from "./pkce";
 
-const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
-const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
+const CURSOR_LOGIN_URL = process.env.CURSOR_LOGIN_URL ?? "https://cursor.com/loginDeepControl";
+const CURSOR_POLL_URL = process.env.CURSOR_POLL_URL ?? "https://api2.cursor.sh/auth/poll";
 const CURSOR_REFRESH_URL =
+  process.env.CURSOR_REFRESH_URL ??
   "https://api2.cursor.sh/auth/exchange_user_api_key";
 
 const POLL_MAX_ATTEMPTS = 150;
@@ -21,6 +22,20 @@ export interface CursorCredentials {
   access: string;
   refresh: string;
   expires: number;
+}
+
+export interface CursorOauthState {
+  type: "oauth";
+  access?: string;
+  refresh?: string;
+  expires?: number;
+}
+
+export interface EnsureCursorAccessTokenOptions {
+  getAuth: () => Promise<CursorOauthState | null | undefined>;
+  persistAuth: (credentials: CursorCredentials) => Promise<void>;
+  refresh?: (refreshToken: string) => Promise<CursorCredentials>;
+  now?: () => number;
 }
 
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
@@ -111,6 +126,34 @@ export async function refreshCursorToken(
     refresh: data.refreshToken || refreshToken,
     expires: getTokenExpiry(data.accessToken),
   };
+}
+
+export async function ensureCursorAccessToken(
+  options: EnsureCursorAccessTokenOptions,
+): Promise<string> {
+  const auth = await options.getAuth();
+  if (!auth || auth.type !== "oauth") {
+    throw new Error("Cursor auth not configured");
+  }
+
+  const now = options.now ?? Date.now;
+  if (
+    typeof auth.access === "string" &&
+    auth.access &&
+    typeof auth.expires === "number" &&
+    auth.expires > now()
+  ) {
+    return auth.access;
+  }
+
+  if (typeof auth.refresh !== "string" || !auth.refresh) {
+    throw new Error("Cursor refresh token missing");
+  }
+
+  const refresh = options.refresh ?? refreshCursorToken;
+  const refreshed = await refresh(auth.refresh);
+  await options.persistAuth(refreshed);
+  return refreshed.access;
 }
 
 /**
