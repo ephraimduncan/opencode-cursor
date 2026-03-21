@@ -80,7 +80,7 @@ const configBuf = await readMessage();
 if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
-const { accessToken, url, path: rpcPath } = config;
+const { accessToken, url, path: rpcPath, contentType, connectProtocolVersion } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -104,18 +104,22 @@ client.on("error", () => {
   process.exit(1);
 });
 
-const h2Stream = client.request({
+const headers = {
   ":method": "POST",
   ":path": rpcPath || "/agent.v1.AgentService/Run",
-  "content-type": "application/connect+proto",
-  "connect-protocol-version": "1",
+  "content-type": contentType || "application/connect+proto",
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
   "x-cursor-client-version": CURSOR_CLIENT_VERSION,
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
-});
+};
+if (connectProtocolVersion) {
+  headers["connect-protocol-version"] = connectProtocolVersion;
+}
+
+const h2Stream = client.request(headers);
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {

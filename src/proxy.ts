@@ -191,6 +191,8 @@ interface SpawnBridgeOptions {
   accessToken: string;
   rpcPath: string;
   url?: string;
+  contentType?: string;
+  connectProtocolVersion?: string;
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -212,6 +214,8 @@ function spawnBridge(options: SpawnBridgeOptions): {
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
+    contentType: options.contentType,
+    connectProtocolVersion: options.connectProtocolVersion,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -282,6 +286,8 @@ interface CursorUnaryRpcOptions {
   requestBody: Uint8Array;
   url?: string;
   timeoutMs?: number;
+  contentType?: string;
+  connectProtocolVersion?: string;
 }
 
 export async function callCursorUnaryRpc(
@@ -291,6 +297,8 @@ export async function callCursorUnaryRpc(
     accessToken: options.accessToken,
     rpcPath: options.rpcPath,
     url: options.url,
+    contentType: options.contentType ?? "application/grpc+proto",
+    connectProtocolVersion: options.connectProtocolVersion,
   });
   const chunks: Buffer[] = [];
   const { promise, resolve } = Promise.withResolvers<{
@@ -1263,6 +1271,8 @@ function startBridge(
   const bridge = spawnBridge({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
+    contentType: "application/connect+proto",
+    connectProtocolVersion: "1",
   });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
