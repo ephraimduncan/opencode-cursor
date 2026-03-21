@@ -758,8 +758,63 @@ function createConnectFrameParser(
   };
 }
 
+const THINKING_TAG_NAMES = ['think', 'thinking', 'reasoning', 'thought', 'think_intent'];
+const MAX_THINKING_TAG_LEN = 16; // </think_intent> is 15 chars
+
+/**
+ * Strip thinking tags from streamed text, routing tagged content to reasoning.
+ * Buffers partial tags across chunk boundaries.
+ */
+function createThinkingTagFilter(): {
+  process(text: string): { content: string; reasoning: string };
+  flush(): { content: string; reasoning: string };
+} {
+  let buffer = '';
+  let inThinking = false;
+
+  return {
+    process(text: string) {
+      const input = buffer + text;
+      buffer = '';
+      let content = '';
+      let reasoning = '';
+      let lastIdx = 0;
+
+      const re = new RegExp(`<(/?)(?:${THINKING_TAG_NAMES.join('|')})\\s*>`, 'gi');
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(input)) !== null) {
+        const before = input.slice(lastIdx, match.index);
+        if (inThinking) reasoning += before;
+        else content += before;
+        inThinking = match[1] !== '/';
+        lastIdx = re.lastIndex;
+      }
+
+      const rest = input.slice(lastIdx);
+      // Buffer a trailing '<' that could be the start of a thinking tag.
+      const ltPos = rest.lastIndexOf('<');
+      if (ltPos >= 0 && rest.length - ltPos < MAX_THINKING_TAG_LEN && /^<\/?[a-z_]*$/i.test(rest.slice(ltPos))) {
+        buffer = rest.slice(ltPos);
+        const before = rest.slice(0, ltPos);
+        if (inThinking) reasoning += before;
+        else content += before;
+      } else {
+        if (inThinking) reasoning += rest;
+        else content += rest;
+      }
+
+      return { content, reasoning };
+    },
+    flush() {
+      const b = buffer;
+      buffer = '';
+      if (!b) return { content: '', reasoning: '' };
+      return inThinking ? { content: '', reasoning: b } : { content: b, reasoning: '' };
+    },
+  };
+}
+
 interface StreamState {
-  thinkingActive: boolean;
   toolCallIndex: number;
   pendingExecs: PendingExec[];
 }
@@ -1083,10 +1138,10 @@ function createBridgeStreamResponse(
       });
 
       const state: StreamState = {
-        thinkingActive: false,
         toolCallIndex: 0,
         pendingExecs: [],
       };
+      const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
 
@@ -1105,17 +1160,11 @@ function createBridgeStreamResponse(
               state,
               (text, isThinking) => {
                 if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
+                  const { content, reasoning } = tagFilter.process(text);
+                  if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
+                  if (content) sendSSE(makeChunk({ content }));
                 }
               },
               // onMcpExec — the model wants to execute a tool.
@@ -1123,10 +1172,9 @@ function createBridgeStreamResponse(
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
+                const flushed = tagFilter.flush();
+                if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+                if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
                 const toolCallIndex = state.toolCallIndex++;
                 sendSSE(makeChunk({
@@ -1184,9 +1232,9 @@ function createBridgeStreamResponse(
           stored.lastAccessMs = Date.now();
         }
         if (!mcpExecReceived) {
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
+          const flushed = tagFilter.flush();
+          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
           sendSSE(makeChunk({}, "stop"));
           sendDone();
           closeController();
@@ -1342,10 +1390,10 @@ async function collectFullResponse(
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
   const state: StreamState = {
-    thinkingActive: false,
     toolCallIndex: 0,
     pendingExecs: [],
   };
+  const tagFilter = createThinkingTagFilter();
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -1360,7 +1408,11 @@ async function collectFullResponse(
           payload.mcpTools,
           (data) => bridge.write(data),
           state,
-          (text) => { fullText += text; },
+          (text, isThinking) => {
+            if (isThinking) return;
+            const { content } = tagFilter.process(text);
+            fullText += content;
+          },
           () => {},
           (checkpointBytes) => {
             const stored = conversationStates.get(bridgeKey);
@@ -1384,6 +1436,8 @@ async function collectFullResponse(
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
     }
+    const flushed = tagFilter.flush();
+    fullText += flushed.content;
     resolve(fullText);
   });
 
