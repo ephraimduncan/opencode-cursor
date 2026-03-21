@@ -115,10 +115,6 @@ interface ChatCompletionRequest {
   tool_choice?: unknown;
 }
 
-interface ProxyModelInfo {
-  id: string;
-  name: string;
-}
 
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
@@ -171,13 +167,13 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
  * Spawn the Node H2 bridge and return read/write handles.
  * The bridge uses length-prefixed framing on stdin/stdout.
  */
-export interface SpawnBridgeOptions {
+interface SpawnBridgeOptions {
   accessToken: string;
   rpcPath: string;
   url?: string;
 }
 
-export function spawnBridge(options: SpawnBridgeOptions): {
+function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
   end: () => void;
@@ -260,7 +256,7 @@ export function spawnBridge(options: SpawnBridgeOptions): {
   };
 }
 
-export interface CursorUnaryRpcOptions {
+interface CursorUnaryRpcOptions {
   accessToken: string;
   rpcPath: string;
   requestBody: Uint8Array;
@@ -312,9 +308,9 @@ export async function callCursorUnaryRpc(
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
-let proxyModels: ProxyModelInfo[] = [];
+let proxyModels: Array<{ id: string; name: string }> = [];
 
-function buildOpenAIModelList(models: ReadonlyArray<ProxyModelInfo>): Array<{
+function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
   object: "model";
   created: number;
@@ -334,7 +330,7 @@ export function getProxyPort(): number | undefined {
 
 export async function startProxy(
   getAccessToken: () => Promise<string>,
-  models: ReadonlyArray<ProxyModelInfo> = [],
+  models: ReadonlyArray<{ id: string; name: string }> = [],
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   proxyModels = models.map((model) => ({

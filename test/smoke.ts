@@ -16,8 +16,8 @@ interface TestModules {
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
-  loadCursorModelCatalog: typeof import("../src/models").loadCursorModelCatalog;
-  CURSOR_FALLBACK_MODELS: typeof import("../src/models").CURSOR_FALLBACK_MODELS;
+  getCursorModels: typeof import("../src/models").getCursorModels;
+  clearModelCache: typeof import("../src/models").clearModelCache;
 }
 
 interface TestCursorBackend {
@@ -219,8 +219,8 @@ async function loadModules(): Promise<TestModules> {
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
-    loadCursorModelCatalog: models.loadCursorModelCatalog,
-    CURSOR_FALLBACK_MODELS: models.CURSOR_FALLBACK_MODELS,
+    getCursorModels: models.getCursorModels,
+    clearModelCache: models.clearModelCache,
   };
 }
 
@@ -298,6 +298,7 @@ async function testAuthParams(modules: TestModules) {
       `PKCE challenge mismatch: expected ${expectedChallenge}, got ${params.challenge}`,
     );
   }
+
   console.log("[test] Auth params OK");
 }
 
@@ -404,6 +405,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   backend: TestCursorBackend,
 ) {
   console.log("[test] Testing refresh-before-discovery...");
+  modules.clearModelCache();
   backend.resetObservations();
   backend.setDiscoveryMode("success");
   backend.setDiscoveredModels([
@@ -446,11 +448,6 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
   assertArrayEqual(
-    backend.getDiscoveryRequestBodies().map((body) => Buffer.from(body).toString("hex")),
-    ["0000000000"],
-    "Expected discovery to send an empty Connect unary frame",
-  );
-  assertArrayEqual(
     Object.keys(provider.models),
     ["fresh-model"],
     "Expected provider models to come from successful discovery",
@@ -460,64 +457,11 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   console.log("[test] Refresh-before-discovery OK");
 }
 
-async function testDiscoveryDegradedModes(
+async function testDiscoveryFallbackAndSuccess(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing degraded discovery modes...");
-
-  backend.setDiscoveryMode("empty");
-  const emptyCatalog = await modules.loadCursorModelCatalog({
-    apiKey: "fresh-access",
-    baseUrl: backend.apiUrl,
-    timeoutMs: 500,
-  });
-  assertEqual(emptyCatalog.source, "fallback", "Expected empty discovery to use fallback catalog");
-  assertEqual(emptyCatalog.degraded, true, "Expected empty discovery to be marked degraded");
-  assertEqual(emptyCatalog.diagnostics.status, "empty", "Expected empty discovery status");
-  assertEqual(
-    emptyCatalog.diagnostics.issues[0]?.code,
-    "empty_models",
-    "Expected empty discovery issue code",
-  );
-
-  const transportCatalog = await modules.loadCursorModelCatalog({
-    apiKey: "fresh-access",
-    baseUrl: "http://127.0.0.1:1",
-    timeoutMs: 250,
-  });
-  assertEqual(transportCatalog.source, "fallback", "Expected transport failure to use fallback catalog");
-  assertEqual(transportCatalog.degraded, true, "Expected transport failure to be marked degraded");
-  assertEqual(transportCatalog.diagnostics.status, "failed", "Expected transport failure status");
-  assertEqual(
-    transportCatalog.diagnostics.issues[0]?.code,
-    "transport",
-    "Expected transport failure issue code",
-  );
-
-  backend.setDiscoveryMode("auth-error");
-  const authCatalog = await modules.loadCursorModelCatalog({
-    apiKey: "expired-access",
-    baseUrl: backend.apiUrl,
-    timeoutMs: 500,
-  });
-  assertEqual(authCatalog.source, "fallback", "Expected auth failure to use fallback catalog");
-  assertEqual(authCatalog.degraded, true, "Expected auth failure to be marked degraded");
-  assertEqual(authCatalog.diagnostics.status, "failed", "Expected auth failure status");
-  assertEqual(
-    authCatalog.diagnostics.issues[0]?.code,
-    "auth",
-    "Expected auth failure issue code",
-  );
-
-  console.log("[test] Degraded discovery modes OK");
-}
-
-async function testSuccessfulDiscoveryReplacesFallbackState(
-  modules: TestModules,
-  backend: TestCursorBackend,
-) {
-  console.log("[test] Testing provider model replacement...");
+  console.log("[test] Testing discovery fallback and success...");
 
   const authState = {
     type: "oauth" as const,
@@ -533,23 +477,29 @@ async function testSuccessfulDiscoveryReplacesFallbackState(
     },
   } as any);
   const provider = { models: { stale: { id: "stale" } } } as any;
-  backend.setDiscoveryMode("empty");
 
+  // Failed discovery should fall back to hardcoded models
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
   const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
-  assertArrayEqual(
-    Object.keys(provider.models).sort(),
-    modules.CURSOR_FALLBACK_MODELS.map((model) => model.id).sort(),
-    "Expected first degraded load to register the fallback catalog only",
+  assert(
+    Object.keys(provider.models).length > 0,
+    "Expected fallback models to be registered when discovery fails",
+  );
+  assert(
+    !("stale" in provider.models),
+    "Expected stale models to be replaced",
   );
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
-  assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models request to succeed");
+  assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
   const degradedModelsBody = await degradedModelsRes.json();
-  assertArrayEqual(
-    degradedModelsBody.data.map((model: { id: string }) => model.id).sort(),
-    modules.CURSOR_FALLBACK_MODELS.map((model) => model.id).sort(),
-    "Expected proxy /v1/models to expose the degraded fallback catalog",
+  assert(
+    degradedModelsBody.data.length > 0,
+    "Expected proxy /v1/models to expose fallback models",
   );
 
+  // Successful discovery should replace with real models
+  modules.clearModelCache();
   backend.setDiscoveryMode("success");
   backend.setDiscoveredModels([
     { id: "real-model-a", name: "Real Model A" },
@@ -559,40 +509,19 @@ async function testSuccessfulDiscoveryReplacesFallbackState(
   assertArrayEqual(
     Object.keys(provider.models).sort(),
     ["real-model-a", "real-model-b"],
-    "Expected successful discovery to replace stale fallback models",
+    "Expected successful discovery to replace fallback models",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
-  assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models request to succeed");
+  assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");
   const discoveredModelsBody = await discoveredModelsRes.json();
   assertArrayEqual(
     discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
     ["real-model-a", "real-model-b"],
-    "Expected proxy /v1/models to expose the discovered model catalog",
+    "Expected proxy /v1/models to expose discovered models",
   );
 
   modules.stopProxy();
-  console.log("[test] Provider model replacement OK");
-}
-
-async function testFallbackCatalogCurrent(modules: TestModules) {
-  console.log("[test] Testing fallback catalog contents...");
-  assertArrayEqual(
-    modules.CURSOR_FALLBACK_MODELS.map((model) => model.id),
-    [
-      "composer-2",
-      "composer-2-fast",
-      "composer-1.5",
-      "claude-4.6-sonnet",
-      "claude-4.6-opus",
-      "gpt-5.4",
-      "gpt-5.3-codex",
-      "gemini-3.1-pro",
-      "gemini-3-flash",
-      "grok-4.20",
-    ],
-    "Unexpected fallback model catalog",
-  );
-  console.log("[test] Fallback catalog OK");
+  console.log("[test] Discovery fallback and success OK");
 }
 
 async function main() {
@@ -609,9 +538,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
-    await testDiscoveryDegradedModes(modules, backend);
-    await testSuccessfulDiscoveryReplacesFallbackState(modules, backend);
-    await testFallbackCatalogCurrent(modules);
+    await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

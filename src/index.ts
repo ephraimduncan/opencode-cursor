@@ -7,16 +7,12 @@
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
-  ensureCursorAccessToken,
   generateCursorAuthParams,
   getTokenExpiry,
   pollCursorAuth,
+  refreshCursorToken,
 } from "./auth";
-import {
-  loadCursorModelCatalog,
-  type CursorModel,
-  type CursorModelCatalog,
-} from "./models";
+import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
@@ -36,35 +32,49 @@ export const CursorAuthPlugin: Plugin = async (
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
-        const getValidAccessToken = () =>
-          ensureCursorAccessToken({
-            getAuth: async () => {
-              const currentAuth = await getAuth();
-              return currentAuth && currentAuth.type === "oauth"
-                ? currentAuth
-                : null;
-            },
-            persistAuth: async (credentials) => {
-              await input.client.auth.set({
-                path: { id: CURSOR_PROVIDER_ID },
-                body: {
-                  type: "oauth",
-                  refresh: credentials.refresh,
-                  access: credentials.access,
-                  expires: credentials.expires,
-                },
-              });
+        // Ensure we have a valid access token, refreshing if expired
+        let accessToken = auth.access;
+        if (!accessToken || auth.expires < Date.now()) {
+          const refreshed = await refreshCursorToken(auth.refresh);
+          await input.client.auth.set({
+            path: { id: CURSOR_PROVIDER_ID },
+            body: {
+              type: "oauth",
+              refresh: refreshed.refresh,
+              access: refreshed.access,
+              expires: refreshed.expires,
             },
           });
+          accessToken = refreshed.access;
+        }
 
-        const accessToken = await getValidAccessToken();
-        const modelCatalog = await loadCursorModelCatalog({ apiKey: accessToken });
-        const port = await startProxy(getValidAccessToken, modelCatalog.models);
+        const models = await getCursorModels(accessToken);
 
-        reportModelDiscovery(modelCatalog);
+        const port = await startProxy(async () => {
+          const currentAuth = await getAuth();
+          if (currentAuth.type !== "oauth") {
+            throw new Error("Cursor auth not configured");
+          }
+
+          if (!currentAuth.access || currentAuth.expires < Date.now()) {
+            const refreshed = await refreshCursorToken(currentAuth.refresh);
+            await input.client.auth.set({
+              path: { id: CURSOR_PROVIDER_ID },
+              body: {
+                type: "oauth",
+                refresh: refreshed.refresh,
+                access: refreshed.access,
+                expires: refreshed.expires,
+              },
+            });
+            return refreshed.access;
+          }
+
+          return currentAuth.access;
+        }, models);
 
         if (provider) {
-          (provider as any).models = buildCursorProviderModels(modelCatalog.models, port);
+          (provider as any).models = buildCursorProviderModels(models, port);
         }
 
         return {
@@ -129,23 +139,6 @@ export const CursorAuthPlugin: Plugin = async (
     },
   };
 };
-
-function reportModelDiscovery(catalog: CursorModelCatalog): void {
-  if (catalog.diagnostics.issues.length === 0) return;
-
-  const summary = catalog.diagnostics.issues
-    .map((issue) => `${issue.code}: ${issue.message}`)
-    .join("; ");
-
-  if (catalog.degraded) {
-    console.warn(
-      `[cursor] Model discovery degraded; using fallback catalog (${summary})`,
-    );
-    return;
-  }
-
-  console.warn(`[cursor] Model discovery incomplete; using parsed subset (${summary})`);
-}
 
 function buildCursorProviderModels(
   models: CursorModel[],

@@ -1,7 +1,7 @@
 /**
  * Cursor model discovery via GetUsableModels.
- * Dynamic discovery is the source of truth. A small fallback catalog is used
- * only when discovery is degraded.
+ * Uses the H2 bridge for transport. Falls back to a hardcoded list
+ * when discovery fails.
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
@@ -43,318 +43,56 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-/**
- * Verified from current Cursor docs. Keep this intentionally small: it is a
- * degraded-mode escape hatch, not a synthetic account inventory.
- */
-export const CURSOR_FALLBACK_MODELS: CursorModel[] = [
-  {
-    id: "composer-2",
-    name: "Composer 2",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "composer-2-fast",
-    name: "Composer 2 Fast",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "composer-1.5",
-    name: "Composer 1.5",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "claude-4.6-sonnet",
-    name: "Claude 4.6 Sonnet",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "claude-4.6-opus",
-    name: "Claude 4.6 Opus",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "gpt-5.4",
-    name: "GPT-5.4",
-    reasoning: true,
-    contextWindow: 272_000,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "gpt-5.3-codex",
-    name: "GPT-5.3 Codex",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "gemini-3.1-pro",
-    name: "Gemini 3.1 Pro",
-    reasoning: false,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "gemini-3-flash",
-    name: "Gemini 3 Flash",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
-  {
-    id: "grok-4.20",
-    name: "Grok 4.20",
-    reasoning: true,
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-  },
+const FALLBACK_MODELS: CursorModel[] = [
+  { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet", name: "Claude 4 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-3.5-sonnet", name: "Claude 3.5 Sonnet", reasoning: false, contextWindow: 200_000, maxTokens: 8_192 },
+  { id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128_000, maxTokens: 16_384 },
+  { id: "cursor-small", name: "Cursor Small", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
 ];
 
-export type CursorModelDiscoveryIssueCode =
-  | "auth"
-  | "transport"
-  | "decode"
-  | "empty_response"
-  | "empty_models"
-  | "parse_drop";
-
-export interface CursorModelDiscoveryIssue {
-  code: CursorModelDiscoveryIssueCode;
-  message: string;
-}
-
-export type CursorModelDiscoveryStatus =
-  | "success"
-  | "partial"
-  | "empty"
-  | "failed";
-
-export interface CursorModelDiscoveryDiagnostics {
-  status: CursorModelDiscoveryStatus;
-  issues: CursorModelDiscoveryIssue[];
-  responseModelCount: number;
-  parsedModelCount: number;
-}
-
-export interface CursorModelCatalog {
-  models: CursorModel[];
-  source: "discovered" | "fallback";
-  degraded: boolean;
-  diagnostics: CursorModelDiscoveryDiagnostics;
-}
-
-export interface CursorModelDiscoveryOptions {
-  apiKey: string;
-  baseUrl?: string;
-  timeoutMs?: number;
-}
-
-interface CursorModelDiscoveryResult extends CursorModelDiscoveryDiagnostics {
-  models: CursorModel[];
-}
-
-export async function loadCursorModelCatalog(
-  options: CursorModelDiscoveryOptions,
-): Promise<CursorModelCatalog> {
-  const discovery = await discoverCursorModels(options);
-  if (discovery.status === "success" || discovery.status === "partial") {
-    return {
-      models: discovery.models,
-      source: "discovered",
-      degraded: false,
-      diagnostics: discovery,
-    };
-  }
-
-  return {
-    models: [...CURSOR_FALLBACK_MODELS],
-    source: "fallback",
-    degraded: true,
-    diagnostics: discovery,
-  };
-}
-
-async function discoverCursorModels(
-  options: CursorModelDiscoveryOptions,
-): Promise<CursorModelDiscoveryResult> {
-  const requestPayload = create(GetUsableModelsRequestSchema, {});
-  const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
-  let response: Awaited<ReturnType<typeof callCursorUnaryRpc>>;
+async function fetchCursorUsableModels(
+  apiKey: string,
+): Promise<CursorModel[] | null> {
   try {
-    response = await callCursorUnaryRpc({
-      accessToken: options.apiKey,
+    const requestPayload = create(GetUsableModelsRequestSchema, {});
+    const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
+
+    const response = await callCursorUnaryRpc({
+      accessToken: apiKey,
       rpcPath: GET_USABLE_MODELS_PATH,
       requestBody,
-      url: options.baseUrl,
-      timeoutMs: options.timeoutMs,
     });
-  } catch (error) {
-    return failedDiscovery({
-      code: "transport",
-      message: `Cursor GetUsableModels bridge failed to start: ${error instanceof Error ? error.message : String(error)}`,
-    });
-  }
 
-  const errorIssue = classifyDiscoveryFailure(response);
-  if (errorIssue) {
-    return failedDiscovery(errorIssue);
-  }
-
-  const decoded = decodeGetUsableModelsResponse(response.body);
-  if (!decoded) {
-    return failedDiscovery({
-      code: "decode",
-      message: "Cursor GetUsableModels response could not be decoded",
-    });
-  }
-
-  const normalized = normalizeCursorModels(decoded.models);
-  const issues: CursorModelDiscoveryIssue[] = [];
-
-  if (normalized.totalCount === 0) {
-    issues.push({
-      code: "empty_models",
-      message: "Cursor GetUsableModels succeeded but returned no models",
-    });
-    return {
-      status: "empty",
-      issues,
-      responseModelCount: 0,
-      parsedModelCount: 0,
-      models: [],
-    };
-  }
-
-  if (normalized.droppedCount > 0) {
-    issues.push({
-      code: "parse_drop",
-      message: `Dropped ${normalized.droppedCount} unusable model entries from Cursor discovery`,
-    });
-  }
-
-  if (normalized.models.length === 0) {
-    return {
-      status: "failed",
-      issues,
-      responseModelCount: normalized.totalCount,
-      parsedModelCount: 0,
-      models: [],
-    };
-  }
-
-  return {
-    status: issues.length > 0 ? "partial" : "success",
-    issues,
-    responseModelCount: normalized.totalCount,
-    parsedModelCount: normalized.models.length,
-    models: normalized.models,
-  };
-}
-
-function failedDiscovery(
-  issue: CursorModelDiscoveryIssue,
-): CursorModelDiscoveryResult {
-  return {
-    status: "failed",
-    issues: [issue],
-    responseModelCount: 0,
-    parsedModelCount: 0,
-    models: [],
-  };
-}
-
-function classifyDiscoveryFailure(
-  response: Awaited<ReturnType<typeof callCursorUnaryRpc>>,
-): CursorModelDiscoveryIssue | null {
-  if (response.timedOut) {
-    return {
-      code: "transport",
-      message: "Cursor GetUsableModels request timed out",
-    };
-  }
-
-  const structuredError = decodeStructuredError(response.body);
-  if (structuredError) {
-    return {
-      code: inferIssueCodeFromError(structuredError),
-      message: structuredError.message,
-    };
-  }
-
-  if (response.exitCode !== 0) {
-    return {
-      code: "transport",
-      message: `Cursor GetUsableModels bridge exited with code ${response.exitCode}`,
-    };
-  }
-
-  if (response.body.length === 0) {
-    return {
-      code: "empty_response",
-      message: "Cursor GetUsableModels returned an empty response body",
-    };
-  }
-
-  return null;
-}
-
-function decodeStructuredError(payload: Uint8Array): {
-  code?: string;
-  message: string;
-} | null {
-  if (payload.length === 0) return null;
-
-  try {
-    const text = new TextDecoder().decode(payload).trim();
-    if (!text.startsWith("{")) return null;
-    const parsed = JSON.parse(text) as Record<string, unknown>;
-
-    if (parsed.error && typeof parsed.error === "object") {
-      const error = parsed.error as Record<string, unknown>;
-      const message = typeof error.message === "string" ? error.message : null;
-      if (!message) return null;
-      return {
-        code: typeof error.code === "string" ? error.code : undefined,
-        message,
-      };
+    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+      return null;
     }
 
-    const message = typeof parsed.message === "string" ? parsed.message : null;
-    if (!message) return null;
-    return {
-      code: typeof parsed.code === "string" ? parsed.code : undefined,
-      message,
-    };
+    const decoded = decodeGetUsableModelsResponse(response.body);
+    if (!decoded) return null;
+
+    const models = normalizeCursorModels(decoded.models);
+    return models.length > 0 ? models : null;
   } catch {
     return null;
   }
 }
 
-function inferIssueCodeFromError(error: {
-  code?: string;
-  message: string;
-}): CursorModelDiscoveryIssueCode {
-  const haystack = `${error.code ?? ""} ${error.message}`.toLowerCase();
-  if (
-    haystack.includes("unauth") ||
-    haystack.includes("forbidden") ||
-    haystack.includes("token") ||
-    haystack.includes("auth") ||
-    haystack.includes("permission")
-  ) {
-    return "auth";
-  }
-  return "transport";
+let cachedModels: CursorModel[] | null = null;
+
+export async function getCursorModels(
+  apiKey: string,
+): Promise<CursorModel[]> {
+  if (cachedModels) return cachedModels;
+  const discovered = await fetchCursorUsableModels(apiKey);
+  cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  return cachedModels;
+}
+
+/** @internal Test-only. */
+export function clearModelCache(): void {
+  cachedModels = null;
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {
@@ -402,32 +140,17 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   return null;
 }
 
-function normalizeCursorModels(models: readonly unknown[]): {
-  models: CursorModel[];
-  totalCount: number;
-  droppedCount: number;
-} {
-  if (models.length === 0) {
-    return { models: [], totalCount: 0, droppedCount: 0 };
-  }
+function normalizeCursorModels(
+  models: readonly unknown[],
+): CursorModel[] {
+  if (models.length === 0) return [];
 
   const byId = new Map<string, CursorModel>();
-  let droppedCount = 0;
-
   for (const model of models) {
     const normalized = normalizeSingleModel(model);
-    if (!normalized) {
-      droppedCount++;
-      continue;
-    }
-    byId.set(normalized.id, normalized);
+    if (normalized) byId.set(normalized.id, normalized);
   }
-
-  return {
-    models: [...byId.values()].sort((a, b) => a.id.localeCompare(b.id)),
-    totalCount: models.length,
-    droppedCount,
-  };
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function normalizeSingleModel(model: unknown): CursorModel | null {
