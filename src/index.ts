@@ -29,81 +29,109 @@ export const CursorAuthPlugin: Plugin = async (
       provider: CURSOR_PROVIDER_ID,
 
       async loader(getAuth, provider) {
-        const auth = await getAuth();
-        if (!auth || auth.type !== "oauth") return {};
+        try {
+          const auth = await getAuth();
+          if (!auth || auth.type !== "oauth") return {};
 
-        // Ensure we have a valid access token, refreshing if expired
-        let accessToken = auth.access;
-        if (!accessToken || auth.expires < Date.now()) {
-          const refreshed = await refreshCursorToken(auth.refresh);
-          await input.client.auth.set({
-            path: { id: CURSOR_PROVIDER_ID },
-            body: {
-              type: "oauth",
-              refresh: refreshed.refresh,
-              access: refreshed.access,
-              expires: refreshed.expires,
-            },
-          });
-          accessToken = refreshed.access;
-        }
-
-        const models = await getCursorModels(accessToken);
-
-        const port = await startProxy(async () => {
-          const currentAuth = await getAuth();
-          if (currentAuth.type !== "oauth") {
-            throw new Error("Cursor auth not configured");
-          }
-
-          if (!currentAuth.access || currentAuth.expires < Date.now()) {
-            const refreshed = await refreshCursorToken(currentAuth.refresh);
-            await input.client.auth.set({
-              path: { id: CURSOR_PROVIDER_ID },
-              body: {
-                type: "oauth",
-                refresh: refreshed.refresh,
-                access: refreshed.access,
-                expires: refreshed.expires,
-              },
-            });
-            return refreshed.access;
-          }
-
-          return currentAuth.access;
-        }, models);
-
-        if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
-        }
-
-        return {
-          baseURL: `http://localhost:${port}/v1`,
-          apiKey: "cursor-proxy",
-          async fetch(
-            requestInput: RequestInfo | URL,
-            init?: RequestInit,
-          ) {
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete("authorization");
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(
-                  ([key]) => key.toLowerCase() !== "authorization",
-                );
-              } else {
-                delete (init.headers as Record<string, string>)[
-                  "authorization"
-                ];
-                delete (init.headers as Record<string, string>)[
-                  "Authorization"
-                ];
-              }
+          // Ensure we have a valid access token, refreshing if expired
+          let accessToken = auth.access;
+          if (!accessToken || auth.expires < Date.now()) {
+            if (!auth.refresh) {
+              console.error("[cursor-oauth] No refresh token available — re-authenticate with: opencode auth login --provider cursor");
+              return {};
             }
+            try {
+              const refreshed = await refreshCursorToken(auth.refresh);
+              await input.client.auth.set({
+                path: { id: CURSOR_PROVIDER_ID },
+                body: {
+                  type: "oauth",
+                  refresh: refreshed.refresh,
+                  access: refreshed.access,
+                  expires: refreshed.expires,
+                },
+              });
+              accessToken = refreshed.access;
+            } catch (refreshErr) {
+              console.error(`[cursor-oauth] Token refresh failed: ${refreshErr instanceof Error ? refreshErr.message : refreshErr}`);
+              console.error("[cursor-oauth] Re-authenticate with: opencode auth login --provider cursor");
+              return {};
+            }
+          }
 
-            return fetch(requestInput, init);
-          },
-        };
+          let models: CursorModel[];
+          try {
+            models = await getCursorModels(accessToken);
+          } catch (modelErr) {
+            console.error(`[cursor-oauth] Model discovery failed, using fallback models: ${modelErr instanceof Error ? modelErr.message : modelErr}`);
+            models = await getCursorModels(accessToken); // getCursorModels already has internal fallback
+          }
+
+          let port: number;
+          try {
+            port = await startProxy(async () => {
+              const currentAuth = await getAuth();
+              if (currentAuth.type !== "oauth") {
+                throw new Error("Cursor auth not configured");
+              }
+
+              if (!currentAuth.access || currentAuth.expires < Date.now()) {
+                const refreshed = await refreshCursorToken(currentAuth.refresh);
+                await input.client.auth.set({
+                  path: { id: CURSOR_PROVIDER_ID },
+                  body: {
+                    type: "oauth",
+                    refresh: refreshed.refresh,
+                    access: refreshed.access,
+                    expires: refreshed.expires,
+                  },
+                });
+                return refreshed.access;
+              }
+
+              return currentAuth.access;
+            }, models);
+          } catch (proxyErr) {
+            console.error(`[cursor-oauth] Proxy failed to start: ${proxyErr instanceof Error ? proxyErr.message : proxyErr}`);
+            return {};
+          }
+
+          if (provider) {
+            (provider as any).models = buildCursorProviderModels(models, port);
+          }
+
+          return {
+            baseURL: `http://localhost:${port}/v1`,
+            apiKey: "cursor-proxy",
+            async fetch(
+              requestInput: RequestInfo | URL,
+              init?: RequestInit,
+            ) {
+              if (init?.headers) {
+                if (init.headers instanceof Headers) {
+                  init.headers.delete("authorization");
+                } else if (Array.isArray(init.headers)) {
+                  init.headers = init.headers.filter(
+                    ([key]) => key.toLowerCase() !== "authorization",
+                  );
+                } else {
+                  delete (init.headers as Record<string, string>)[
+                    "authorization"
+                  ];
+                  delete (init.headers as Record<string, string>)[
+                    "Authorization"
+                  ];
+                }
+              }
+
+              return fetch(requestInput, init);
+            },
+          };
+        } catch (err) {
+          // Catch-all: never let loader errors propagate and kill other plugins
+          console.error(`[cursor-oauth] Loader failed: ${err instanceof Error ? err.message : err}`);
+          return {};
+        }
       },
 
       methods: [
