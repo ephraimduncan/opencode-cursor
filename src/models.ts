@@ -45,11 +45,17 @@ export interface CursorModel {
 
 const FALLBACK_MODELS: CursorModel[] = [
   { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2-fast", name: "Composer 2 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-sonnet", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "claude-4-sonnet", name: "Claude 4 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-3.5-sonnet", name: "Claude 3.5 Sonnet", reasoning: false, contextWindow: 200_000, maxTokens: 8_192 },
-  { id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128_000, maxTokens: 16_384 },
-  { id: "cursor-small", name: "Cursor Small", reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "gpt-5.4", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 128_000, maxTokens: 128_000 },
+  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "grok-4.20", name: "Grok 4.20", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
 ];
 
 async function fetchCursorUsableModels(
