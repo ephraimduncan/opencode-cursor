@@ -192,23 +192,15 @@ function buildCursorProviderModels(
   );
 }
 
-/**
- * Cost rates ($/M tokens) sourced from Cursor's official pricing page:
- * https://cursor.com/docs/models-and-pricing
- *
- * OpenCode computes cost as: (tokens × rate) / 1_000_000
- * so these values are the raw $/M numbers from the pricing table.
- */
 interface ModelCost {
   input: number;
   output: number;
   cache: { read: number; write: number };
 }
 
-// Exact model ID → cost ($/M tokens), from cursor.com/docs/models-and-pricing.
-// Keys are normalized to lowercase for matching.
+// $/M token rates from cursor.com/docs/models-and-pricing
 const MODEL_COST_TABLE: Record<string, ModelCost> = {
-  // ── Anthropic ──────────────────────────────────────────────────────
+  // Anthropic
   "claude-4-sonnet":         { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
   "claude-4-sonnet-1m":      { input: 6, output: 22.5, cache: { read: 0.6, write: 7.5 } },
   "claude-4.5-haiku":        { input: 1, output: 5, cache: { read: 0.1, write: 1.25 } },
@@ -218,20 +210,20 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "claude-4.6-opus-fast":    { input: 30, output: 150, cache: { read: 3, write: 37.5 } },
   "claude-4.6-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
 
-  // ── Cursor ────────────────────────────────────────────────────────
+  // Cursor
   "composer-1":              { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "composer-1.5":            { input: 3.5, output: 17.5, cache: { read: 0.35, write: 0 } },
   "composer-2":              { input: 0.5, output: 2.5, cache: { read: 0.2, write: 0 } },
   "composer-2-fast":         { input: 1.5, output: 7.5, cache: { read: 0.2, write: 0 } },
 
-  // ── Google ────────────────────────────────────────────────────────
+  // Google
   "gemini-2.5-flash":        { input: 0.3, output: 2.5, cache: { read: 0.03, write: 0 } },
   "gemini-3-flash":          { input: 0.5, output: 3, cache: { read: 0.05, write: 0 } },
   "gemini-3-pro":            { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
   "gemini-3-pro-image":      { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
   "gemini-3.1-pro":          { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
 
-  // ── OpenAI ────────────────────────────────────────────────────────
+  // OpenAI
   "gpt-5":                   { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "gpt-5-fast":              { input: 2.5, output: 20, cache: { read: 0.25, write: 0 } },
   "gpt-5-mini":              { input: 0.25, output: 2, cache: { read: 0.025, write: 0 } },
@@ -246,16 +238,14 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.4-mini":            { input: 0.75, output: 4.5, cache: { read: 0.075, write: 0 } },
   "gpt-5.4-nano":            { input: 0.2, output: 1.25, cache: { read: 0.02, write: 0 } },
 
-  // ── xAI ───────────────────────────────────────────────────────────
+  // xAI
   "grok-4.20":               { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
 
-  // ── Moonshot ──────────────────────────────────────────────────────
+  // Moonshot
   "kimi-k2.5":               { input: 0.6, output: 3, cache: { read: 0.1, write: 0 } },
 };
 
-// Fallback patterns for dynamically discovered models whose exact ID
-// doesn't appear in the table (e.g. "claude-4.6-opus-high", "gpt-5.4-medium").
-// Ordered most-specific first.
+// Most-specific first
 const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCost }> = [
   { match: (id) => /claude.*opus.*fast/i.test(id),   cost: MODEL_COST_TABLE["claude-4.6-opus-fast"]! },
   { match: (id) => /claude.*opus/i.test(id),         cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
@@ -284,21 +274,17 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /kimi/i.test(id),                 cost: MODEL_COST_TABLE["kimi-k2.5"]! },
 ];
 
-// Sonnet-tier default for completely unknown models.
 const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
 
 function estimateModelCost(modelId: string): ModelCost {
-  // Try exact match first (strip common suffixes like -high, -medium, -low)
   const normalized = modelId.toLowerCase();
   const exact = MODEL_COST_TABLE[normalized];
   if (exact) return exact;
 
-  // Try stripping routing suffixes: -high, -medium, -low, -preview, -thinking
   const stripped = normalized.replace(/-(high|medium|low|preview|thinking|spark-preview)$/g, "");
   const strippedMatch = MODEL_COST_TABLE[stripped];
   if (strippedMatch) return strippedMatch;
 
-  // Fall back to pattern matching
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 

@@ -825,9 +825,7 @@ function createThinkingTagFilter(): {
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
-  /** Accumulated output tokens from Cursor's TokenDeltaUpdate messages. */
   outputTokens: number;
-  /** Total context tokens (prompt + output) from checkpoint tokenDetails. */
   totalTokens: number;
 }
 
