@@ -114,7 +114,6 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
-  stream_options?: { include_usage?: boolean };
 }
 
 
@@ -829,6 +828,13 @@ interface StreamState {
   totalTokens: number;
 }
 
+function computeUsage(state: StreamState) {
+  const completion_tokens = state.outputTokens;
+  const total_tokens = state.totalTokens || completion_tokens;
+  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
+  return { prompt_tokens, completion_tokens, total_tokens };
+}
+
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -881,7 +887,7 @@ function handleInteractionUpdate(
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs \u2192 mcpResult), not interaction updates.
+  // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1181,22 +1187,15 @@ function createBridgeStreamResponse(
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
 
-      /** Final SSE chunk with token usage (empty choices per OpenAI spec). */
-      const makeUsageChunk = (st: StreamState) => {
-        const output = st.outputTokens;
-        const total = st.totalTokens || output;
-        const input = Math.max(0, total - output);
+      const makeUsageChunk = () => {
+        const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
         return {
           id: completionId,
           object: "chat.completion.chunk",
           created,
           model: modelId,
           choices: [],
-          usage: {
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: total,
-          },
+          usage: { prompt_tokens, completion_tokens, total_tokens },
         };
       };
 
@@ -1301,7 +1300,7 @@ function createBridgeStreamResponse(
           if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
           if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
           sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk(state));
+          sendSSE(makeUsageChunk());
           sendDone();
           closeController();
         } else if (code !== 0) {
@@ -1309,7 +1308,7 @@ function createBridgeStreamResponse(
           // Close the SSE stream so the client doesn't hang forever.
           sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
           sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk(state));
+          sendSSE(makeUsageChunk());
           sendDone();
           closeController();
           // Remove stale entry so the next request doesn't try to resume it.
@@ -1511,12 +1510,10 @@ async function collectFullResponse(
     const flushed = tagFilter.flush();
     fullText += flushed.content;
 
-    const output = state.outputTokens;
-    const total = state.totalTokens || output;
-    const input = Math.max(0, total - output);
+    const usage = computeUsage(state);
     resolve({
       text: fullText,
-      usage: { prompt_tokens: input, completion_tokens: output, total_tokens: total },
+      usage,
     });
   });
 
