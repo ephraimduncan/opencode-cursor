@@ -191,6 +191,8 @@ interface SpawnBridgeOptions {
   accessToken: string;
   rpcPath: string;
   url?: string;
+  /** When true, use application/proto for unary RPCs instead of Connect streaming. */
+  unary?: boolean;
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -212,6 +214,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
+    unary: options.unary ?? false,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -291,6 +294,7 @@ export async function callCursorUnaryRpc(
     accessToken: options.accessToken,
     rpcPath: options.rpcPath,
     url: options.url,
+    unary: true,
   });
   const chunks: Buffer[] = [];
   const { promise, resolve } = Promise.withResolvers<{
@@ -319,7 +323,8 @@ export async function callCursorUnaryRpc(
     });
   });
 
-  bridge.write(frameConnectMessage(options.requestBody));
+  // Unary: send raw protobuf body (no Connect framing)
+  bridge.write(options.requestBody);
   bridge.end();
 
   return promise;
@@ -440,8 +445,10 @@ function handleChatCompletion(
     );
   }
 
-  // Check for an active bridge waiting for tool results
+  // bridgeKey: model-specific, for active tool-call bridges
+  // convKey: model-independent, for conversation state that survives model switches
   const bridgeKey = deriveBridgeKey(modelId, body.messages);
+  const convKey = deriveConversationKey(body.messages);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -449,7 +456,7 @@ function handleChatCompletion(
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey);
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -465,15 +472,15 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  let stored = conversationStates.get(bridgeKey);
+  let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = {
-      conversationId: crypto.randomUUID(),
+      conversationId: deterministicConversationId(convKey),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     };
-    conversationStates.set(bridgeKey, stored);
+    conversationStates.set(convKey, stored);
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
@@ -491,9 +498,9 @@ function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, bridgeKey);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
 }
 
 interface ToolResultInfo {
@@ -1085,15 +1092,41 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-/** Derive a stable key to associate a bridge with a conversation. */
+/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  // Stable key from model + first user message text.
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
+}
+
+/** Derive a key for conversation state. Model-independent so context survives model switches. */
+function deriveConversationKey(messages: OpenAIMessage[]): string {
+  const firstUserMsg = messages.find((m) => m.role === "user");
+  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+  return createHash("sha256")
+    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/** Deterministic UUID derived from convKey so Cursor's server-side conversation
+ *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
+function deterministicConversationId(convKey: string): string {
+  const hex = createHash("sha256")
+    .update(`cursor-conv-id:${convKey}`)
+    .digest("hex")
+    .slice(0, 32);
+  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    `4${hex.slice(13, 16)}`,
+    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
+    hex.slice(20, 32),
+  ].join("-");
 }
 
 /** Create an SSE streaming Response that reads from a live bridge. */
@@ -1104,6 +1137,7 @@ function createBridgeStreamResponse(
   mcpTools: McpToolDefinition[],
   modelId: string,
   bridgeKey: string,
+  convKey: string,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1203,7 +1237,7 @@ function createBridgeStreamResponse(
                 closeController();
               },
               (checkpointBytes) => {
-                const stored = conversationStates.get(bridgeKey);
+                const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
                   stored.lastAccessMs = Date.now();
@@ -1226,7 +1260,7 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
-        const stored = conversationStates.get(bridgeKey);
+        const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
@@ -1274,12 +1308,13 @@ function handleStreamingResponse(
   accessToken: string,
   modelId: string,
   bridgeKey: string,
+  convKey: string,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
-    modelId, bridgeKey,
+    modelId, bridgeKey, convKey,
   );
 }
 
@@ -1289,6 +1324,7 @@ function handleToolResultResume(
   toolResults: ToolResultInfo[],
   modelId: string,
   bridgeKey: string,
+  convKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
@@ -1342,7 +1378,7 @@ function handleToolResultResume(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
-    modelId, bridgeKey,
+    modelId, bridgeKey, convKey,
   );
 }
 
@@ -1350,11 +1386,11 @@ async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-  bridgeKey: string,
+  convKey: string,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const fullText = await collectFullResponse(payload, accessToken, bridgeKey);
+  const fullText = await collectFullResponse(payload, accessToken, convKey);
 
   return new Response(
     JSON.stringify({
@@ -1382,7 +1418,7 @@ async function handleNonStreamingResponse(
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
-  bridgeKey: string,
+  convKey: string,
 ): Promise<string> {
   const { promise, resolve } = Promise.withResolvers<string>();
   let fullText = "";
@@ -1415,7 +1451,7 @@ async function collectFullResponse(
           },
           () => {},
           (checkpointBytes) => {
-            const stored = conversationStates.get(bridgeKey);
+            const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
               stored.lastAccessMs = Date.now();
@@ -1431,7 +1467,7 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(bridgeKey);
+    const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
