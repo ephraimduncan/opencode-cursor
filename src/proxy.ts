@@ -114,6 +114,7 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
+  stream_options?: { include_usage?: boolean };
 }
 
 
@@ -824,6 +825,10 @@ function createThinkingTagFilter(): {
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
+  /** Accumulated output tokens from Cursor's TokenDeltaUpdate messages. */
+  outputTokens: number;
+  /** Total context tokens (prompt + output) from checkpoint tokenDetails. */
+  totalTokens: number;
 }
 
 function processServerMessage(
@@ -839,7 +844,7 @@ function processServerMessage(
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, onText);
+    handleInteractionUpdate(msg.message.value, state, onText);
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -849,15 +854,20 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
     );
-  } else if (msgCase === "conversationCheckpointUpdate" && onCheckpoint) {
-    onCheckpoint(
-      toBinary(ConversationStateStructureSchema, msg.message.value as ConversationStateStructure),
-    );
+  } else if (msgCase === "conversationCheckpointUpdate") {
+    const stateStructure = msg.message.value as ConversationStateStructure;
+    if (stateStructure.tokenDetails) {
+      state.totalTokens = stateStructure.tokenDetails.usedTokens;
+    }
+    if (onCheckpoint) {
+      onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+    }
   }
 }
 
 function handleInteractionUpdate(
   update: any,
+  state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
 ): void {
   const updateCase = update.message?.case;
@@ -868,10 +878,12 @@ function handleInteractionUpdate(
   } else if (updateCase === "thinkingDelta") {
     const delta = update.message.value.text || "";
     if (delta) onText(delta, true);
+  } else if (updateCase === "tokenDelta") {
+    state.outputTokens += update.message.value.tokens ?? 0;
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs → mcpResult), not interaction updates.
+  // message path (mcpArgs \u2192 mcpResult), not interaction updates.
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1171,9 +1183,30 @@ function createBridgeStreamResponse(
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
 
+      /** Final SSE chunk with token usage (empty choices per OpenAI spec). */
+      const makeUsageChunk = (st: StreamState) => {
+        const output = st.outputTokens;
+        const total = st.totalTokens || output;
+        const input = Math.max(0, total - output);
+        return {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelId,
+          choices: [],
+          usage: {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: total,
+          },
+        };
+      };
+
       const state: StreamState = {
         toolCallIndex: 0,
         pendingExecs: [],
+        outputTokens: 0,
+        totalTokens: 0,
       };
       const tagFilter = createThinkingTagFilter();
 
@@ -1270,6 +1303,7 @@ function createBridgeStreamResponse(
           if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
           if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
           sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk(state));
           sendDone();
           closeController();
         } else if (code !== 0) {
@@ -1277,6 +1311,7 @@ function createBridgeStreamResponse(
           // Close the SSE stream so the client doesn't hang forever.
           sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
           sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk(state));
           sendDone();
           closeController();
           // Remove stale entry so the next request doesn't try to resume it.
@@ -1390,7 +1425,7 @@ async function handleNonStreamingResponse(
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const fullText = await collectFullResponse(payload, accessToken, convKey);
+  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
 
   return new Response(
     JSON.stringify({
@@ -1401,26 +1436,27 @@ async function handleNonStreamingResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: fullText },
+          message: { role: "assistant", content: text },
           finish_reason: "stop",
         },
       ],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
+      usage,
     }),
     { headers: { "Content-Type": "application/json" } },
   );
+}
+
+interface CollectedResponse {
+  text: string;
+  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 }
 
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
-): Promise<string> {
-  const { promise, resolve } = Promise.withResolvers<string>();
+): Promise<CollectedResponse> {
+  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
@@ -1428,6 +1464,8 @@ async function collectFullResponse(
   const state: StreamState = {
     toolCallIndex: 0,
     pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
 
@@ -1474,7 +1512,14 @@ async function collectFullResponse(
     }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
-    resolve(fullText);
+
+    const output = state.outputTokens;
+    const total = state.totalTokens || output;
+    const input = Math.max(0, total - output);
+    resolve({
+      text: fullText,
+      usage: { prompt_tokens: input, completion_tokens: output, total_tokens: total },
+    });
   });
 
   return promise;
