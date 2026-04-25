@@ -52,6 +52,8 @@ const FALLBACK_MODELS: CursorModel[] = [
   { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   // GPT models
+  { id: "gpt-5.5", name: "GPT-5.5", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.5-pro", name: "GPT-5.5 Pro", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
   { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },

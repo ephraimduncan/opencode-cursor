@@ -224,6 +224,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gemini-3.1-pro":          { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
 
   // OpenAI
+  "gpt-5.5":                 { input: 3, output: 15, cache: { read: 0.3, write: 0 } },
+  "gpt-5.5-pro":             { input: 10, output: 30, cache: { read: 1, write: 0 } },
   "gpt-5":                   { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "gpt-5-fast":              { input: 2.5, output: 20, cache: { read: 0.25, write: 0 } },
   "gpt-5-mini":              { input: 0.25, output: 2, cache: { read: 0.025, write: 0 } },
@@ -255,6 +257,8 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /composer-?2/i.test(id),          cost: MODEL_COST_TABLE["composer-2"]! },
   { match: (id) => /composer-?1\.5/i.test(id),      cost: MODEL_COST_TABLE["composer-1.5"]! },
   { match: (id) => /composer/i.test(id),             cost: MODEL_COST_TABLE["composer-1"]! },
+  { match: (id) => /gpt-5\.5.*pro/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.5-pro"]! },
+  { match: (id) => /gpt-5\.5/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.5"]! },
   { match: (id) => /gpt-5\.4.*nano/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-nano"]! },
   { match: (id) => /gpt-5\.4.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
   { match: (id) => /gpt-5\.4/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.4"]! },
