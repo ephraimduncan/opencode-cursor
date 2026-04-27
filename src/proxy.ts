@@ -333,6 +333,8 @@ export async function callCursorUnaryRpc(
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+const CURSOR_AUTO_PROXY_MODEL = { id: "auto", name: "Auto" };
+
 let proxyModels: Array<{ id: string; name: string }> = [];
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
@@ -349,6 +351,13 @@ function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }
   }));
 }
 
+function mergeAutoProxyModel(
+  models: ReadonlyArray<{ id: string; name: string }>,
+): Array<{ id: string; name: string }> {
+  const withoutAuto = models.filter((model) => model.id !== CURSOR_AUTO_PROXY_MODEL.id);
+  return [...withoutAuto, CURSOR_AUTO_PROXY_MODEL];
+}
+
 export function getProxyPort(): number | undefined {
   return proxyPort;
 }
@@ -358,10 +367,7 @@ export async function startProxy(
   models: ReadonlyArray<{ id: string; name: string }> = [],
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
-  proxyModels = models.map((model) => ({
-    id: model.id,
-    name: model.name,
-  }));
+  proxyModels = mergeAutoProxyModel(models);
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({

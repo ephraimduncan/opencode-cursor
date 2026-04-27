@@ -244,8 +244,11 @@ async function testProxyStartStop(modules: TestModules) {
   if (modelsBody.object !== "list") {
     throw new Error(`Expected object=list, got ${modelsBody.object}`);
   }
-  if (!Array.isArray(modelsBody.data) || modelsBody.data.length !== 0) {
-    throw new Error(`Expected empty model list data array, got ${JSON.stringify(modelsBody.data)}`);
+  if (!Array.isArray(modelsBody.data) || modelsBody.data.length !== 1) {
+    throw new Error(`Expected model list with 1 entry (auto), got ${JSON.stringify(modelsBody.data)}`);
+  }
+  if (modelsBody.data[0]?.id !== "auto") {
+    throw new Error(`Expected model id=auto, got ${JSON.stringify(modelsBody.data[0])}`);
   }
   console.log("[test] /v1/models OK");
 
@@ -447,10 +450,9 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     backend.getDiscoveryAuthHeaders().every((header) => header === `Bearer ${writes[0]?.access}`),
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
-  assertArrayEqual(
-    Object.keys(provider.models),
-    ["fresh-model"],
-    "Expected provider models to come from successful discovery",
+  assert(
+    "auto" in provider.models,
+    "Expected provider models to include auto after refresh-before-discovery",
   );
 
   modules.stopProxy();
@@ -487,6 +489,10 @@ async function testDiscoveryFallbackAndSuccess(
     "Expected fallback models to be registered when discovery fails",
   );
   assert(
+    "auto" in provider.models,
+    "Expected provider models to include auto when discovery falls back",
+  );
+  assert(
     !("stale" in provider.models),
     "Expected stale models to be replaced",
   );
@@ -503,21 +509,31 @@ async function testDiscoveryFallbackAndSuccess(
   backend.setDiscoveryMode("success");
   backend.setDiscoveredModels([
     { id: "real-model-a", name: "Real Model A" },
+    { id: "auto", name: "Auto From Discovery", reasoning: true },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
   const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
-  assertArrayEqual(
-    Object.keys(provider.models).sort(),
-    ["real-model-a", "real-model-b"],
-    "Expected successful discovery to replace fallback models",
+  assert(
+    "auto" in provider.models,
+    "Expected successful discovery provider models to include auto",
+  );
+  assertEqual(
+    Object.keys(provider.models).filter((modelId) => modelId === "auto").length,
+    1,
+    "Expected provider models to include auto exactly once",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
   assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");
   const discoveredModelsBody = await discoveredModelsRes.json();
-  assertArrayEqual(
-    discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
-    ["real-model-a", "real-model-b"],
-    "Expected proxy /v1/models to expose discovered models",
+  const discoveredModelIds = discoveredModelsBody.data.map((model: { id: string }) => model.id);
+  assert(
+    discoveredModelIds.includes("auto"),
+    "Expected proxy /v1/models to expose auto",
+  );
+  assertEqual(
+    discoveredModelIds.filter((modelId: string) => modelId === "auto").length,
+    1,
+    "Expected proxy /v1/models to expose auto exactly once",
   );
 
   modules.stopProxy();

@@ -16,6 +16,13 @@ import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
+const CURSOR_AUTO_MODEL: CursorModel = {
+  id: "auto",
+  name: "Auto",
+  reasoning: true,
+  contextWindow: 200_000,
+  maxTokens: 64_000,
+};
 
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
@@ -144,8 +151,10 @@ function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
 ): Record<string, any> {
+  const providerModels = mergeAutoModel(models);
+
   return Object.fromEntries(
-    models.map((model) => [
+    providerModels.map((model) => [
       model.id,
       {
         id: model.id,
@@ -190,6 +199,11 @@ function buildCursorProviderModels(
       },
     ]),
   );
+}
+
+function mergeAutoModel(models: readonly CursorModel[]): CursorModel[] {
+  const withoutAuto = models.filter((model) => model.id !== CURSOR_AUTO_MODEL.id);
+  return [...withoutAuto, CURSOR_AUTO_MODEL];
 }
 
 interface ModelCost {
