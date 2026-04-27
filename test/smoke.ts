@@ -1,8 +1,9 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -20,6 +21,11 @@ interface TestModules {
   clearModelCache: typeof import("../src/models").clearModelCache;
 }
 
+interface ObservedRunRequest {
+  modelId: string | undefined;
+  hasModelDetails: boolean;
+}
+
 interface TestCursorBackend {
   apiUrl: string;
   refreshUrl: string;
@@ -29,6 +35,7 @@ interface TestCursorBackend {
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
+  getRunRequests: () => ObservedRunRequest[];
   close: () => Promise<void>;
 }
 
@@ -68,6 +75,38 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
+function decodeConnectStreamingMessages(payload: Uint8Array): Uint8Array[] {
+  const messages: Uint8Array[] = [];
+  let offset = 0;
+  while (offset + 5 <= payload.length) {
+    const flags = payload[offset]!;
+    const messageLength = new DataView(
+      payload.buffer,
+      payload.byteOffset + offset,
+      payload.byteLength - offset,
+    ).getUint32(1, false);
+    const frameEnd = offset + 5 + messageLength;
+    if (frameEnd > payload.length) break;
+    if ((flags & 0b0000_0010) === 0) {
+      messages.push(payload.subarray(offset + 5, frameEnd));
+    }
+    offset = frameEnd;
+  }
+  return messages;
+}
+
+function observeRunRequest(body: Uint8Array): ObservedRunRequest | null {
+  const [messageBytes] = decodeConnectStreamingMessages(body);
+  if (!messageBytes) return null;
+  const clientMessage = fromBinary(AgentClientMessageSchema, messageBytes);
+  if (clientMessage.message.case !== "runRequest") return null;
+  const runRequest = clientMessage.message.value;
+  return {
+    modelId: runRequest.modelDetails?.modelId,
+    hasModelDetails: runRequest.modelDetails !== undefined,
+  };
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -76,6 +115,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const discoveryAuthHeaders: string[] = [];
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
+  const runRequests: ObservedRunRequest[] = [];
 
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
@@ -108,21 +148,32 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   apiServer.on("stream", (stream, headers) => {
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
-    if (path === "/agent.v1.AgentService/Run") {
-      stream.respond({
-        ":status": 200,
-        "content-type": "application/connect+proto",
-      });
-      stream.end();
-      return;
-    }
-
     const chunks: Buffer[] = [];
 
     stream.on("data", (chunk) => {
       chunks.push(Buffer.from(chunk));
     });
+
     stream.on("end", () => {
+      if (path === "/agent.v1.AgentService/Run") {
+        const observed = observeRunRequest(new Uint8Array(Buffer.concat(chunks)));
+        if (observed) runRequests.push(observed);
+        if (!stream.destroyed) {
+          try {
+            stream.respond({
+              ":status": 200,
+              "content-type": "application/connect+proto",
+            });
+            stream.end();
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ERR_HTTP2_INVALID_STREAM") {
+              throw error;
+            }
+          }
+        }
+        return;
+      }
+
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
@@ -184,6 +235,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
+      runRequests.length = 0;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
@@ -193,6 +245,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
+    },
+    getRunRequests() {
+      return [...runRequests];
     },
     async close() {
       await Promise.all([
@@ -403,6 +458,58 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Array content parsing OK");
 }
 
+async function testAutoModelSendsDiscoveredCursorModelDetails(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing auto model request encoding...");
+  backend.resetObservations();
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: false,
+      messages: [{ role: "user", content: "use automatic model selection" }],
+    }),
+  });
+
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "composer-2",
+      stream: false,
+      messages: [{ role: "user", content: "use explicit model selection" }],
+    }),
+  });
+
+  const [autoRequest, explicitRequest] = backend.getRunRequests();
+  assert(autoRequest, "Expected auto model request to reach Cursor backend");
+  assert(
+    autoRequest.hasModelDetails,
+    `Expected auto model to include modelDetails, got ${JSON.stringify(autoRequest)}`,
+  );
+  assertEqual(
+    autoRequest.modelId,
+    "composer-2",
+    "Expected auto model to resolve to the first discovered Cursor model",
+  );
+  assert(explicitRequest, "Expected explicit model request to reach Cursor backend");
+  assertEqual(
+    explicitRequest.modelId,
+    "composer-2",
+    "Expected explicit model id to be forwarded",
+  );
+
+  modules.stopProxy();
+  console.log("[test] Auto model request encoding OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -553,6 +660,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
+    await testAutoModelSendsDiscoveredCursorModelDetails(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

@@ -358,6 +358,15 @@ function mergeAutoProxyModel(
   return [...withoutAuto, CURSOR_AUTO_PROXY_MODEL];
 }
 
+function resolveCursorRunModelId(modelId: string): string {
+  if (modelId !== CURSOR_AUTO_PROXY_MODEL.id) return modelId;
+  const discoveredDefaultModel = proxyModels.find((model) => model.id !== CURSOR_AUTO_PROXY_MODEL.id);
+  if (!discoveredDefaultModel) {
+    throw new Error("Cursor auto model requires at least one discovered Cursor model");
+  }
+  return discoveredDefaultModel.id;
+}
+
 export function getProxyPort(): number | undefined {
   return proxyPort;
 }
@@ -699,17 +708,18 @@ function buildCursorRequest(
     },
   });
 
+  const cursorModelId = resolveCursorRunModelId(modelId);
   const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
+    modelId: cursorModelId,
+    displayModelId: cursorModelId,
+    displayName: cursorModelId,
   });
 
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails,
     conversationId,
+    ...(modelDetails ? { modelDetails } : {}),
   });
 
   const clientMessage = create(AgentClientMessageSchema, {
