@@ -429,7 +429,8 @@ function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Response | Promise<Response> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const messagesForCursor = normalizeMessagesForCursor(body);
+  const { systemPrompt, userText, turns, toolResults } = parseMessages(messagesForCursor);
   const modelId = body.model;
   const tools = body.tools ?? [];
 
@@ -447,8 +448,8 @@ function handleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const bridgeKey = deriveBridgeKey(modelId, messagesForCursor);
+  const convKey = deriveConversationKey(messagesForCursor);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -572,6 +573,32 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   }
 
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+}
+
+/**
+ * OpenCode `ensureTitle` sends consecutive user messages:
+ * prefix `Generate a title for this conversation:` plus context (prompt.ts).
+ * parseMessages would treat that as an extra bogus turn and break Cursor KV state.
+ */
+function normalizeMessagesForCursor(body: ChatCompletionRequest): OpenAIMessage[] {
+  if ((body.tools?.length ?? 0) > 0) {
+    return body.messages;
+  }
+
+  const firstUser = body.messages.find((m) => m.role === "user");
+  const text = firstUser ? textContent(firstUser.content) : "";
+  if (!/^\s*Generate a title for this conversation\b/i.test(text)) {
+    return body.messages;
+  }
+
+  const systems = body.messages.filter((m) => m.role === "system");
+  const users = body.messages.filter((m) => m.role === "user");
+  if (users.length < 2) {
+    return body.messages;
+  }
+
+  const merged = users.map((m) => textContent(m.content)).join("\n\n");
+  return [...systems, { role: "user", content: merged }];
 }
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
@@ -1108,22 +1135,32 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
+/** Concatenate system prompts for session fingerprinting (order-stable). */
+function systemPromptFingerprint(messages: OpenAIMessage[]): string {
+  return messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join("\u001f");
+}
+
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+  const sys = systemPromptFingerprint(messages);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${modelId}:${sys}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
 function deriveConversationKey(messages: OpenAIMessage[]): string {
+  const sys = systemPromptFingerprint(messages);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .update(`conv:${sys}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
