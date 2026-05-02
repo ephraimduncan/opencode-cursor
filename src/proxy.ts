@@ -46,6 +46,7 @@ import {
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  RequestedModelSchema,
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
@@ -358,15 +359,6 @@ function mergeAutoProxyModel(
   return [...withoutAuto, CURSOR_AUTO_PROXY_MODEL];
 }
 
-function resolveCursorRunModelId(modelId: string): string {
-  if (modelId !== CURSOR_AUTO_PROXY_MODEL.id) return modelId;
-  const discoveredDefaultModel = proxyModels.find((model) => model.id !== CURSOR_AUTO_PROXY_MODEL.id);
-  if (!discoveredDefaultModel) {
-    throw new Error("Cursor auto model requires at least one discovered Cursor model");
-  }
-  return discoveredDefaultModel.id;
-}
-
 export function getProxyPort(): number | undefined {
   return proxyPort;
 }
@@ -647,7 +639,7 @@ function buildCursorRequest(
   const systemBytes = new TextEncoder().encode(systemJson);
   const systemBlobId = putBlob(systemBytes);
 
-  let conversationState;
+  let conversationState: ConversationStateStructure;
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
@@ -708,18 +700,26 @@ function buildCursorRequest(
     },
   });
 
-  const cursorModelId = resolveCursorRunModelId(modelId);
+  const cursorModelId = modelId === CURSOR_AUTO_PROXY_MODEL.id ? "default" : modelId;
+  const cursorModelName = cursorModelId === "default" ? CURSOR_AUTO_PROXY_MODEL.name : cursorModelId;
+  const requestedModel = create(RequestedModelSchema, {
+    modelId: cursorModelId,
+    maxMode: false,
+    parameters: [],
+  });
   const modelDetails = create(ModelDetailsSchema, {
     modelId: cursorModelId,
     displayModelId: cursorModelId,
-    displayName: cursorModelId,
+    displayName: cursorModelName,
+    displayNameShort: cursorModelName,
   });
 
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
     conversationId,
-    ...(modelDetails ? { modelDetails } : {}),
+    requestedModel,
+    modelDetails,
   });
 
   const clientMessage = create(AgentClientMessageSchema, {
@@ -807,13 +807,14 @@ function createThinkingTagFilter(): {
       let lastIdx = 0;
 
       const re = new RegExp(`<(/?)(?:${THINKING_TAG_NAMES.join('|')})\\s*>`, 'gi');
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(input)) !== null) {
+      let match = re.exec(input);
+      while (match !== null) {
         const before = input.slice(lastIdx, match.index);
         if (inThinking) reasoning += before;
         else content += before;
         inThinking = match[1] !== '/';
         lastIdx = re.lastIndex;
+        match = re.exec(input);
       }
 
       const rest = input.slice(lastIdx);

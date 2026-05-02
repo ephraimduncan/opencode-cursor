@@ -23,7 +23,9 @@ interface TestModules {
 
 interface ObservedRunRequest {
   modelId: string | undefined;
+  requestedModelId: string | undefined;
   hasModelDetails: boolean;
+  displayName: string | undefined;
 }
 
 interface TestCursorBackend {
@@ -103,7 +105,9 @@ function observeRunRequest(body: Uint8Array): ObservedRunRequest | null {
   const runRequest = clientMessage.message.value;
   return {
     modelId: runRequest.modelDetails?.modelId,
+    requestedModelId: runRequest.requestedModel?.modelId,
     hasModelDetails: runRequest.modelDetails !== undefined,
+    displayName: runRequest.modelDetails?.displayName,
   };
 }
 
@@ -458,7 +462,7 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Array content parsing OK");
 }
 
-async function testAutoModelSendsDiscoveredCursorModelDetails(
+async function testAutoModelSendsCursorDefaultModel(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
@@ -496,14 +500,29 @@ async function testAutoModelSendsDiscoveredCursorModelDetails(
   );
   assertEqual(
     autoRequest.modelId,
-    "composer-2",
-    "Expected auto model to resolve to the first discovered Cursor model",
+    "default",
+    "Expected auto model to use Cursor default modelDetails id",
+  );
+  assertEqual(
+    autoRequest.requestedModelId,
+    "default",
+    "Expected auto model to use Cursor default requestedModel id",
+  );
+  assertEqual(
+    autoRequest.displayName,
+    "Auto",
+    "Expected auto model to display as Auto",
   );
   assert(explicitRequest, "Expected explicit model request to reach Cursor backend");
   assertEqual(
     explicitRequest.modelId,
     "composer-2",
-    "Expected explicit model id to be forwarded",
+    "Expected explicit model id to be forwarded in modelDetails",
+  );
+  assertEqual(
+    explicitRequest.requestedModelId,
+    "composer-2",
+    "Expected explicit model id to be forwarded in requestedModel",
   );
 
   modules.stopProxy();
@@ -660,7 +679,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
-    await testAutoModelSendsDiscoveredCursorModelDetails(modules, backend);
+    await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");
