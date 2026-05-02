@@ -16,6 +16,13 @@ import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
+const CURSOR_AUTO_MODEL: CursorModel = {
+  id: "auto",
+  name: "Auto",
+  reasoning: true,
+  contextWindow: 200_000,
+  maxTokens: 64_000,
+};
 
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
@@ -144,8 +151,10 @@ function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
 ): Record<string, any> {
+  const providerModels = mergeAutoModel(models);
+
   return Object.fromEntries(
-    models.map((model) => [
+    providerModels.map((model) => [
       model.id,
       {
         id: model.id,
@@ -192,6 +201,11 @@ function buildCursorProviderModels(
   );
 }
 
+function mergeAutoModel(models: readonly CursorModel[]): CursorModel[] {
+  const withoutAuto = models.filter((model) => model.id !== CURSOR_AUTO_MODEL.id);
+  return [...withoutAuto, CURSOR_AUTO_MODEL];
+}
+
 interface ModelCost {
   input: number;
   output: number;
@@ -207,8 +221,11 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "claude-4.5-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
   "claude-4.5-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
   "claude-4.6-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+  "claude-4.6-opus-high":    { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
   "claude-4.6-opus-fast":    { input: 30, output: 150, cache: { read: 3, write: 37.5 } },
   "claude-4.6-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+  "claude-4.6-sonnet-medium":{ input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+  "claude-4.7-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
 
   // Cursor
   "composer-1":              { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
@@ -224,6 +241,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gemini-3.1-pro":          { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
 
   // OpenAI
+  "gpt-5.5":                 { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
+  "gpt-5.5-pro":             { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
   "gpt-5":                   { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "gpt-5-fast":              { input: 2.5, output: 20, cache: { read: 0.25, write: 0 } },
   "gpt-5-mini":              { input: 0.25, output: 2, cache: { read: 0.025, write: 0 } },
@@ -255,6 +274,8 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /composer-?2/i.test(id),          cost: MODEL_COST_TABLE["composer-2"]! },
   { match: (id) => /composer-?1\.5/i.test(id),      cost: MODEL_COST_TABLE["composer-1.5"]! },
   { match: (id) => /composer/i.test(id),             cost: MODEL_COST_TABLE["composer-1"]! },
+  { match: (id) => /gpt-5\.5.*pro/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.5-pro"]! },
+  { match: (id) => /gpt-5\.5/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.5"]! },
   { match: (id) => /gpt-5\.4.*nano/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-nano"]! },
   { match: (id) => /gpt-5\.4.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
   { match: (id) => /gpt-5\.4/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.4"]! },

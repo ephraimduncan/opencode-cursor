@@ -46,6 +46,7 @@ import {
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  RequestedModelSchema,
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
@@ -333,6 +334,8 @@ export async function callCursorUnaryRpc(
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+const CURSOR_AUTO_PROXY_MODEL = { id: "auto", name: "Auto" };
+
 let proxyModels: Array<{ id: string; name: string }> = [];
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
@@ -349,6 +352,13 @@ function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }
   }));
 }
 
+function mergeAutoProxyModel(
+  models: ReadonlyArray<{ id: string; name: string }>,
+): Array<{ id: string; name: string }> {
+  const withoutAuto = models.filter((model) => model.id !== CURSOR_AUTO_PROXY_MODEL.id);
+  return [...withoutAuto, CURSOR_AUTO_PROXY_MODEL];
+}
+
 export function getProxyPort(): number | undefined {
   return proxyPort;
 }
@@ -358,10 +368,7 @@ export async function startProxy(
   models: ReadonlyArray<{ id: string; name: string }> = [],
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
-  proxyModels = models.map((model) => ({
-    id: model.id,
-    name: model.name,
-  }));
+  proxyModels = mergeAutoProxyModel(models);
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
@@ -475,7 +482,7 @@ function handleChatCompletion(
   let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = {
-      conversationId: deterministicConversationId(convKey),
+      conversationId: crypto.randomUUID(),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -621,16 +628,18 @@ function buildCursorRequest(
   existingBlobStore?: Map<string, Uint8Array>,
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
+  const putBlob = (data: Uint8Array): Uint8Array => {
+    const blobId = new Uint8Array(createHash("sha256").update(data).digest());
+    blobStore.set(Buffer.from(blobId).toString("hex"), data);
+    return blobId;
+  };
 
   // System prompt → blob store (Cursor requests it back via KV handshake)
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  const systemBlobId = putBlob(systemBytes);
 
-  let conversationState;
+  let conversationState: ConversationStateStructure;
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
@@ -641,6 +650,7 @@ function buildCursorRequest(
         messageId: crypto.randomUUID(),
       });
       const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+      const userMsgBlobId = putBlob(userMsgBytes);
 
       const stepBytes: Uint8Array[] = [];
       if (turn.assistantText) {
@@ -650,17 +660,17 @@ function buildCursorRequest(
             value: create(AssistantMessageSchema, { text: turn.assistantText }),
           },
         });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
+        stepBytes.push(putBlob(toBinary(ConversationStepSchema, step)));
       }
 
       const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBytes,
+        userMessage: userMsgBlobId,
         steps: stepBytes,
       });
       const turnStructure = create(ConversationTurnStructureSchema, {
         turn: { case: "agentConversationTurn", value: agentTurn },
       });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+      turnBytes.push(putBlob(toBinary(ConversationTurnStructureSchema, turnStructure)));
     }
 
     conversationState = create(ConversationStateStructureSchema, {
@@ -690,17 +700,26 @@ function buildCursorRequest(
     },
   });
 
+  const cursorModelId = modelId === CURSOR_AUTO_PROXY_MODEL.id ? "default" : modelId;
+  const cursorModelName = cursorModelId === "default" ? CURSOR_AUTO_PROXY_MODEL.name : cursorModelId;
+  const requestedModel = create(RequestedModelSchema, {
+    modelId: cursorModelId,
+    maxMode: false,
+    parameters: [],
+  });
   const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
+    modelId: cursorModelId,
+    displayModelId: cursorModelId,
+    displayName: cursorModelName,
+    displayNameShort: cursorModelName,
   });
 
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails,
     conversationId,
+    requestedModel,
+    modelDetails,
   });
 
   const clientMessage = create(AgentClientMessageSchema, {
@@ -788,13 +807,14 @@ function createThinkingTagFilter(): {
       let lastIdx = 0;
 
       const re = new RegExp(`<(/?)(?:${THINKING_TAG_NAMES.join('|')})\\s*>`, 'gi');
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(input)) !== null) {
+      let match = re.exec(input);
+      while (match !== null) {
         const before = input.slice(lastIdx, match.index);
         if (inThinking) reasoning += before;
         else content += before;
         inThinking = match[1] !== '/';
         lastIdx = re.lastIndex;
+        match = re.exec(input);
       }
 
       const rest = input.slice(lastIdx);
@@ -844,13 +864,14 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onBlobSet?: (blobIdKey: string, blobData: Uint8Array) => void,
 ): void {
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
     handleInteractionUpdate(msg.message.value, state, onText);
   } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame, onBlobSet);
   } else if (msgCase === "execServerMessage") {
     handleExecMessage(
       msg.message.value as ExecServerMessage,
@@ -911,6 +932,7 @@ function handleKvMessage(
   kvMsg: KvServerMessage,
   blobStore: Map<string, Uint8Array>,
   sendFrame: (data: Uint8Array) => void,
+  onBlobSet?: (blobIdKey: string, blobData: Uint8Array) => void,
 ): void {
   const kvCase = kvMsg.message.case;
 
@@ -925,7 +947,9 @@ function handleKvMessage(
     );
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
-    blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
+    const blobIdKey = Buffer.from(blobId).toString("hex");
+    blobStore.set(blobIdKey, blobData);
+    onBlobSet?.(blobIdKey, blobData);
     sendKvResponse(
       kvMsg, "setBlobResult",
       create(SetBlobResultSchema, {}),
@@ -1273,6 +1297,13 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                 }
               },
+              (blobIdKey, blobData) => {
+                const stored = conversationStates.get(convKey);
+                if (stored) {
+                  stored.blobStore.set(blobIdKey, blobData);
+                  stored.lastAccessMs = Date.now();
+                }
+              },
             );
           } catch {
             // Skip unparseable messages
@@ -1489,6 +1520,13 @@ async function collectFullResponse(
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
+              stored.lastAccessMs = Date.now();
+            }
+          },
+          (blobIdKey, blobData) => {
+            const stored = conversationStates.get(convKey);
+            if (stored) {
+              stored.blobStore.set(blobIdKey, blobData);
               stored.lastAccessMs = Date.now();
             }
           },

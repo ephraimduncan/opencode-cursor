@@ -47,11 +47,24 @@ const FALLBACK_MODELS: CursorModel[] = [
   // Composer models
   { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  // Claude models
-  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  // Claude 4 models
+  { id: "claude-4-sonnet", name: "Claude 4 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet-1m", name: "Claude 4 Sonnet 1M", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  // Claude 4.5 models
+  { id: "claude-4.5-haiku", name: "Claude 4.5 Haiku", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-opus", name: "Claude 4.5 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
   { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  // Claude 4.6 models
+  { id: "claude-4.6-opus", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-opus-fast", name: "Claude 4.6 Opus Fast", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-sonnet", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  // Claude 4.7 models
+  { id: "claude-4.7-opus", name: "Claude 4.7 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
   // GPT models
+  { id: "gpt-5.5", name: "GPT-5.5", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.5-pro", name: "GPT-5.5 Pro", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
   { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
