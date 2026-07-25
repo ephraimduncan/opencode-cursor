@@ -4,8 +4,19 @@
  * Enables using Cursor models (Claude, GPT, etc.) inside OpenCode via:
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
+ * 3. A `provider` hook that publishes discovered models into opencode's
+ *    v2 provider catalog (so they appear in the model picker), using the
+ *    stored OAuth token to call Cursor's GetUsableModels RPC.
+ *
+ * Catalog registration uses the `Hooks.provider` hook introduced in
+ * @opencode-ai/plugin 1.2.27. Earlier versions of this plugin mutated
+ * `provider.models` inside the `auth.loader`, which worked on older
+ * opencode builds but is a no-op on opencode 1.18.x — the loader receives a
+ * public copy of the provider, not the live catalog entry. The `provider`
+ * hook is the supported way to populate models.
  */
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginInput, ProviderHook } from "@opencode-ai/plugin";
+import type { Auth as AuthV2, Model as ModelV2 } from "@opencode-ai/sdk/v2";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -13,7 +24,7 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
-import { startProxy } from "./proxy";
+import { startProxy, getProxyPort } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -24,58 +35,112 @@ const CURSOR_PROVIDER_ID = "cursor";
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
+  /**
+   * Resolve a valid Cursor access token from the stored auth, refreshing it
+   * if missing or expired. Persists the refreshed credential back via the
+   * SDK client so subsequent calls (and the proxy's token provider) see it.
+   * Returns the access token, or undefined if no OAuth auth is stored.
+   *
+   * Shared between the `provider.models` hook (catalog build) and the
+   * `auth.loader` hook (inference routing) so the proxy is started exactly
+   * once and both hooks see the same token.
+   */
+  async function ensureAccessToken(
+    getAuth: () => Promise<AuthV2 | undefined>,
+  ): Promise<string | undefined> {
+    const auth = await getAuth();
+    if (!auth || auth.type !== "oauth") return undefined;
+
+    if (auth.access && auth.expires > Date.now()) {
+      return auth.access;
+    }
+
+    if (!auth.refresh) return undefined;
+
+    const refreshed = await refreshCursorToken(auth.refresh);
+    await input.client.auth.set({
+      path: { id: CURSOR_PROVIDER_ID },
+      body: {
+        type: "oauth",
+        refresh: refreshed.refresh,
+        access: refreshed.access,
+        expires: refreshed.expires,
+      },
+    });
+    return refreshed.access;
+  }
+
+  /**
+   * Ensure the local proxy is running and return its port. Idempotent:
+   * startProxy short-circuits when already bound. The token provider closure
+   * re-reads auth on each inference request so it picks up refreshed tokens.
+   */
+  async function ensureProxy(
+    getAuth: () => Promise<AuthV2 | undefined>,
+    models: CursorModel[],
+  ): Promise<number> {
+    const port = getProxyPort();
+    if (port) return port;
+    return startProxy(async () => {
+      const currentAuth = await getAuth();
+      if (!currentAuth || currentAuth.type !== "oauth") {
+        throw new Error("Cursor auth not configured");
+      }
+      if (currentAuth.access && currentAuth.expires > Date.now()) {
+        return currentAuth.access;
+      }
+      const token = await ensureAccessToken(getAuth);
+      if (!token) throw new Error("Cursor auth not configured");
+      return token;
+    }, models);
+  }
+
+  const providerHook: ProviderHook = {
+    id: CURSOR_PROVIDER_ID,
+    async models(_provider, ctx) {
+      // No stored auth yet → user hasn't run `opencode auth login --provider
+      // cursor`. Returning an empty map keeps the provider registered but
+      // model-less, so the picker omits cursor until auth completes. The
+      // daemon rebuilds the catalog (and re-runs this hook) after auth.set.
+      if (!ctx.auth || ctx.auth.type !== "oauth") return {};
+
+      const getAuth = async () => ctx.auth as AuthV2 | undefined;
+      const accessToken = await ensureAccessToken(getAuth);
+      if (!accessToken) return {};
+
+      let models: CursorModel[];
+      try {
+        models = await getCursorModels(accessToken);
+      } catch {
+        return {};
+      }
+
+      const port = await ensureProxy(getAuth, models);
+      return buildCursorProviderModels(models, port);
+    },
+  };
+
   return {
+    provider: providerHook,
+
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
-      async loader(getAuth, provider) {
+      async loader(getAuth, _provider) {
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
-        // Ensure we have a valid access token, refreshing if expired
-        let accessToken = auth.access;
-        if (!accessToken || auth.expires < Date.now()) {
-          const refreshed = await refreshCursorToken(auth.refresh);
-          await input.client.auth.set({
-            path: { id: CURSOR_PROVIDER_ID },
-            body: {
-              type: "oauth",
-              refresh: refreshed.refresh,
-              access: refreshed.access,
-              expires: refreshed.expires,
-            },
-          });
-          accessToken = refreshed.access;
+        const accessToken = await ensureAccessToken(getAuth);
+        if (!accessToken) return {};
+
+        let models: CursorModel[];
+        try {
+          models = await getCursorModels(accessToken);
+        } catch {
+          models = await getCursorModels(accessToken);
         }
 
-        const models = await getCursorModels(accessToken);
-
-        const port = await startProxy(async () => {
-          const currentAuth = await getAuth();
-          if (currentAuth.type !== "oauth") {
-            throw new Error("Cursor auth not configured");
-          }
-
-          if (!currentAuth.access || currentAuth.expires < Date.now()) {
-            const refreshed = await refreshCursorToken(currentAuth.refresh);
-            await input.client.auth.set({
-              path: { id: CURSOR_PROVIDER_ID },
-              body: {
-                type: "oauth",
-                refresh: refreshed.refresh,
-                access: refreshed.access,
-                expires: refreshed.expires,
-              },
-            });
-            return refreshed.access;
-          }
-
-          return currentAuth.access;
-        }, models);
-
-        if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
-        }
+        const port = await ensureProxy(getAuth, models);
 
         return {
           baseURL: `http://localhost:${port}/v1`,
@@ -143,11 +208,10 @@ export const CursorAuthPlugin: Plugin = async (
 function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
-): Record<string, any> {
+): Record<string, ModelV2> {
   return Object.fromEntries(
-    models.map((model) => [
-      model.id,
-      {
+    models.map((model) => {
+      const modelV2: ModelV2 = {
         id: model.id,
         providerID: CURSOR_PROVIDER_ID,
         api: {
@@ -182,13 +246,14 @@ function buildCursorProviderModels(
           context: model.contextWindow,
           output: model.maxTokens,
         },
-        status: "active" as const,
+        status: "active",
         options: {},
         headers: {},
         release_date: "",
         variants: {},
-      },
-    ]),
+      };
+      return [model.id, modelV2];
+    }),
   );
 }
 
