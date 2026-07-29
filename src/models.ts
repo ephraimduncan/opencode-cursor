@@ -62,6 +62,18 @@ const FALLBACK_MODELS: CursorModel[] = [
   { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
 ];
 
+/**
+ * Pseudo-model for Cursor's server-side Auto routing. Always exposed
+ * alongside discovered models; the proxy maps it to Run modelId "default".
+ */
+const AUTO_MODEL: CursorModel = {
+  id: "auto",
+  name: "Auto",
+  reasoning: false,
+  contextWindow: DEFAULT_CONTEXT_WINDOW,
+  maxTokens: DEFAULT_MAX_TOKENS,
+};
+
 async function fetchCursorUsableModels(
   apiKey: string,
 ): Promise<CursorModel[] | null> {
@@ -96,7 +108,8 @@ export async function getCursorModels(
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
-  cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  const models = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  cachedModels = models.some((m) => m.id === AUTO_MODEL.id) ? models : [AUTO_MODEL, ...models];
   return cachedModels;
 }
 

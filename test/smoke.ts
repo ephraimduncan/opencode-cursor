@@ -449,7 +449,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   );
   assertArrayEqual(
     Object.keys(provider.models),
-    ["fresh-model"],
+    ["auto", "fresh-model"],
     "Expected provider models to come from successful discovery",
   );
 
@@ -508,7 +508,7 @@ async function testDiscoveryFallbackAndSuccess(
   const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
   assertArrayEqual(
     Object.keys(provider.models).sort(),
-    ["real-model-a", "real-model-b"],
+    ["auto", "real-model-a", "real-model-b"],
     "Expected successful discovery to replace fallback models",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
@@ -516,7 +516,7 @@ async function testDiscoveryFallbackAndSuccess(
   const discoveredModelsBody = await discoveredModelsRes.json();
   assertArrayEqual(
     discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
-    ["real-model-a", "real-model-b"],
+    ["auto", "real-model-a", "real-model-b"],
     "Expected proxy /v1/models to expose discovered models",
   );
 
