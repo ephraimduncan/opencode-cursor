@@ -1,6 +1,6 @@
 {
   "name": "opencode-cursor-oauth",
-  "version": "0.0.9",
+  "version": "0.1.0",
   "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
   "license": "MIT",
   "type": "module",
@@ -44,8 +44,9 @@
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.2.27",
     "@bufbuild/protobuf": "^2.0.0",
+    "@opencode-ai/plugin": "^1.18.9",
+    "@opencode-ai/sdk": "^1.18.9",
     "zod": "^3.24.0"
   },
   "devDependencies": {

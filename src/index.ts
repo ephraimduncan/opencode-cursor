@@ -5,7 +5,11 @@
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Config, Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Model as ModelV2 } from "@opencode-ai/sdk/v2";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -17,6 +21,107 @@ import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
+/** Model map in opencode's config schema (what the `config` hook injects). */
+type ConfigProviderModels = NonNullable<
+  NonNullable<Config["provider"]>[string]["models"]
+>;
+
+/** Model map in opencode's v2 catalog schema (what the `provider` hook returns). */
+type CatalogModels = Record<string, ModelV2>;
+
+interface StoredOAuth {
+  type: "oauth";
+  refresh: string;
+  access?: string;
+  expires?: number;
+}
+
+/** Read the stored cursor OAuth record directly from disk (mirrors core's Auth.all). */
+async function readStoredCursorAuth(): Promise<StoredOAuth | undefined> {
+  try {
+    const dataDir = process.env.XDG_DATA_HOME
+      ? join(process.env.XDG_DATA_HOME, "opencode")
+      : join(homedir(), ".local", "share", "opencode");
+    const content =
+      process.env.OPENCODE_AUTH_CONTENT ??
+      (await readFile(join(dataDir, "auth.json"), "utf8"));
+    const entry = JSON.parse(content)?.[CURSOR_PROVIDER_ID];
+    if (entry?.type === "oauth" && typeof entry.refresh === "string") {
+      return entry as StoredOAuth;
+    }
+  } catch {}
+  return undefined;
+}
+
+/** Persist refreshed credentials via the opencode server so rotated refresh tokens are not lost. */
+async function persistCursorAuth(
+  input: PluginInput,
+  creds: { refresh: string; access: string; expires: number },
+): Promise<void> {
+  await input.client.auth.set({
+    path: { id: CURSOR_PROVIDER_ID },
+    body: {
+      type: "oauth",
+      refresh: creds.refresh,
+      access: creds.access,
+      expires: creds.expires,
+    },
+  });
+}
+
+/**
+ * Get a usable access token from the on-disk auth store, refreshing when
+ * expired. Used by hooks that run before opencode exposes auth state
+ * (the `config` hook) and by the standalone proxy token provider.
+ */
+async function resolveDiskAccessToken(
+  input: PluginInput,
+): Promise<string | undefined> {
+  const stored = await readStoredCursorAuth();
+  if (!stored) return undefined;
+  if (stored.access && (stored.expires ?? 0) > Date.now()) return stored.access;
+  try {
+    const refreshed = await refreshCursorToken(stored.refresh);
+    // Best-effort: rotated refresh tokens must be saved, but a persistence
+    // failure should not block model discovery for this run.
+    await persistCursorAuth(input, refreshed).catch(() => {});
+    return refreshed.access;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Model entries in opencode's *config* schema (snake_case cost fields).
+ * Injected via the `config` hook so opencode >= 1.18 merges them into its
+ * provider catalog; the v2 catalog no longer picks up models mutated inside
+ * `auth.loader` (issue #30).
+ */
+function buildConfigModels(models: CursorModel[]): ConfigProviderModels {
+  return Object.fromEntries(
+    models.map((model) => {
+      const cost = estimateModelCost(model.id);
+      return [
+        model.id,
+        {
+          name: model.name,
+          temperature: true,
+          reasoning: model.reasoning,
+          attachment: false,
+          tool_call: true,
+          limit: { context: model.contextWindow, output: model.maxTokens },
+          cost: {
+            input: cost.input,
+            output: cost.output,
+            cache_read: cost.cache.read,
+            cache_write: cost.cache.write,
+          },
+        },
+      ];
+    }),
+  );
+}
+
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
  * Register in opencode.json: { "plugin": ["opencode-cursor-oauth"] }
@@ -25,6 +130,61 @@ export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   return {
+    /**
+     * opencode >= 1.18 builds its provider catalog from config + models.dev
+     * before auth loaders run, and `auth.loader` only receives a deep copy of
+     * the provider. Injecting the provider stub and discovered models into the
+     * config here is the only path that reaches the v2 catalog (issue #30).
+     */
+    async config(cfg) {
+      try {
+        const providers = (cfg.provider ??= {});
+        const cursor = (providers[CURSOR_PROVIDER_ID] ??= {});
+        cursor.name ??= "Cursor";
+
+        const accessToken = await resolveDiskAccessToken(input);
+        if (!accessToken) return;
+
+        const models = await getCursorModels(accessToken);
+        const configModels = (cursor.models ??= {});
+        for (const [id, model] of Object.entries(buildConfigModels(models))) {
+          // User-defined model entries win over discovered ones.
+          configModels[id] ??= model;
+        }
+      } catch {
+        // Never block opencode startup on discovery problems; the auth
+        // loader still provides baseURL/fetch for any configured models.
+      }
+    },
+
+    /**
+     * v2 catalog hook (opencode >= 1.18). Only invoked when the `cursor`
+     * provider already exists in opencode's catalog; returns the full
+     * discovered model set backed by the local proxy.
+     */
+    provider: {
+      id: CURSOR_PROVIDER_ID,
+      async models(_provider, ctx) {
+        const auth = ctx.auth;
+        if (!auth || auth.type !== "oauth") return {};
+
+        let accessToken = auth.access;
+        if (!accessToken || auth.expires < Date.now()) {
+          const refreshed = await refreshCursorToken(auth.refresh);
+          await persistCursorAuth(input, refreshed).catch(() => {});
+          accessToken = refreshed.access;
+        }
+
+        const models = await getCursorModels(accessToken);
+        const port = await startProxy(async () => {
+          const token = await resolveDiskAccessToken(input);
+          if (!token) throw new Error("Cursor auth not configured");
+          return token;
+        }, models);
+        return buildCursorProviderModels(models, port);
+      },
+    },
+
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
@@ -143,7 +303,7 @@ export const CursorAuthPlugin: Plugin = async (
 function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
-): Record<string, any> {
+): CatalogModels {
   return Object.fromEntries(
     models.map((model) => [
       model.id,
