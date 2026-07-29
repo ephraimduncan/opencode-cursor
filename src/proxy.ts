@@ -51,6 +51,7 @@ import {
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
+  ResumeActionSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
@@ -66,8 +67,16 @@ import {
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
+import {
+  redirectNativeExec,
+  sendNativeExecResult,
+  type NativeExecBinding,
+} from "./native-tools";
 import { createHash } from "node:crypto";
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
+import { z } from "zod";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -121,6 +130,8 @@ interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  /** System prompt forwarded via RequestContext.cloudRule (issue #21). */
+  cloudRule?: string;
 }
 
 /** A pending tool execution waiting for results from the caller. */
@@ -131,6 +142,8 @@ interface PendingExec {
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
+  /** Set when this exec is a redirected native tool call (issue #21/#29). */
+  native?: NativeExecBinding;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -139,6 +152,7 @@ interface ActiveBridge {
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  cloudRule?: string;
   pendingExecs: PendingExec[];
 }
 
@@ -156,6 +170,92 @@ interface StoredConversation {
 
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// Conversation state also persists to disk so context survives proxy/opencode
+// restarts instead of failing with "Blob not found" (issues #22/#29).
+const CONVERSATION_DISK_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const CONVERSATION_DIR = pathResolve(
+  process.env.XDG_CACHE_HOME ?? pathResolve(homedir(), ".cache"),
+  "opencode-cursor",
+  "conversations",
+);
+
+const PersistedConversationSchema = z.object({
+  conversationId: z.string(),
+  checkpoint: z.string().nullable(),
+  blobs: z.record(z.string()),
+  lastAccessMs: z.number(),
+});
+
+/** Fire-and-forget write of a conversation snapshot to the disk cache. */
+function persistConversation(convKey: string, stored: StoredConversation): void {
+  const payload = {
+    conversationId: stored.conversationId,
+    checkpoint: stored.checkpoint
+      ? Buffer.from(stored.checkpoint).toString("base64")
+      : null,
+    blobs: Object.fromEntries(
+      [...stored.blobStore].map(([id, data]) => [
+        id,
+        Buffer.from(data).toString("base64"),
+      ]),
+    ),
+    lastAccessMs: stored.lastAccessMs,
+  } satisfies z.infer<typeof PersistedConversationSchema>;
+  void mkdir(CONVERSATION_DIR, { recursive: true })
+    .then(() =>
+      writeFile(
+        pathResolve(CONVERSATION_DIR, `${convKey}.json`),
+        JSON.stringify(payload),
+      ),
+    )
+    .catch(() => {});
+}
+
+async function loadPersistedConversation(
+  convKey: string,
+): Promise<StoredConversation | undefined> {
+  try {
+    const raw = await readFile(
+      pathResolve(CONVERSATION_DIR, `${convKey}.json`),
+      "utf8",
+    );
+    const parsed = PersistedConversationSchema.parse(JSON.parse(raw));
+    if (Date.now() - parsed.lastAccessMs > CONVERSATION_DISK_TTL_MS) {
+      return undefined;
+    }
+    return {
+      conversationId: parsed.conversationId,
+      checkpoint: parsed.checkpoint
+        ? new Uint8Array(Buffer.from(parsed.checkpoint, "base64"))
+        : null,
+      blobStore: new Map(
+        Object.entries(parsed.blobs).map(([id, data]) => [
+          id,
+          new Uint8Array(Buffer.from(data, "base64")),
+        ]),
+      ),
+      lastAccessMs: Date.now(),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best-effort removal of conversation files past the disk TTL. */
+function pruneStaleConversationFiles(): void {
+  void (async () => {
+    try {
+      const entries = await readdir(CONVERSATION_DIR);
+      const cutoff = Date.now() - CONVERSATION_DISK_TTL_MS;
+      for (const entry of entries) {
+        const file = pathResolve(CONVERSATION_DIR, entry);
+        const info = await stat(file);
+        if (info.mtimeMs < cutoff) await unlink(file);
+      }
+    } catch {}
+  })();
+}
 
 function evictStaleConversations(): void {
   const now = Date.now();
@@ -364,6 +464,8 @@ export async function startProxy(
   }));
   if (proxyServer && proxyPort) return proxyPort;
 
+  pruneStaleConversationFiles();
+
   proxyServer = Bun.serve({
     port: 0,
     idleTimeout: 255, // max — Cursor responses can take 30s+
@@ -425,15 +527,15 @@ export function stopProxy(): void {
   conversationStates.clear();
 }
 
-function handleChatCompletion(
+async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
-): Response | Promise<Response> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+): Promise<Response> {
+  const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
 
-  if (!userText && toolResults.length === 0) {
+  if (!userText && history.length === 0) {
     return new Response(
       JSON.stringify({
         error: {
@@ -456,7 +558,7 @@ function handleChatCompletion(
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -474,8 +576,10 @@ function handleChatCompletion(
 
   let stored = conversationStates.get(convKey);
   if (!stored) {
-    stored = {
-      conversationId: deterministicConversationId(convKey),
+    // Fall back to the disk cache so conversations survive proxy restarts
+    // and in-memory TTL eviction (issues #22/#29).
+    stored = (await loadPersistedConversation(convKey)) ?? {
+      conversationId: deterministicUuid(`cursor-conv-id:${convKey}`),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -485,14 +589,11 @@ function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
-  // Build the request. When tool results are present but the bridge died,
-  // we must still include the last user text so Cursor has context.
+  // Build the request. When the bridge died mid tool-call, history already
+  // contains the tool results and the request goes out as a resumeAction.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
+    modelId, systemPrompts, userText, history,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -508,10 +609,18 @@ interface ToolResultInfo {
   content: string;
 }
 
+/** One prior conversation event, in message order. */
+type HistoryEntry =
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string }
+  | { kind: "tool"; text: string };
+
 interface ParsedMessages {
-  systemPrompt: string;
+  systemPrompts: string[];
+  /** Trailing user message that becomes the active action ("" = resume). */
   userText: string;
-  turns: Array<{ userText: string; assistantText: string }>;
+  /** Everything before the active user message, in order. */
+  history: HistoryEntry[];
   toolResults: ToolResultInfo[];
 }
 
@@ -526,52 +635,43 @@ function textContent(content: OpenAIMessage["content"]): string {
 }
 
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
-  let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
-
-  // Collect system messages
-  const systemParts = messages
+  const systemPrompts = messages
     .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content));
-  if (systemParts.length > 0) {
-    systemPrompt = systemParts.join("\n");
-  }
+    .map((m) => textContent(m.content))
+    .filter((text) => text.length > 0);
 
-  // Separate tool results from conversation turns
-  const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
+  const toolResults: ToolResultInfo[] = [];
+  const history: HistoryEntry[] = [];
 
-  for (const msg of nonSystem) {
+  for (const msg of messages) {
     if (msg.role === "tool") {
+      const content = textContent(msg.content);
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
+        content,
       });
+      if (content) history.push({ kind: "tool", text: content });
     } else if (msg.role === "user") {
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
-      }
-      pendingUser = textContent(msg.content);
+      history.push({ kind: "user", text: textContent(msg.content) });
     } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
+      // Pure tool_calls messages carry no text; the paired tool entries
+      // preserve that part of the transcript.
       const text = textContent(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
-      }
+      if (text) history.push({ kind: "assistant", text });
     }
   }
 
-  let lastUserText = "";
-  if (pendingUser) {
-    lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
+  // A trailing user message is the active action; anything else (e.g. tool
+  // results after a dead bridge) leaves userText empty and the request is
+  // sent as a resumeAction over the reconstructed history.
+  let userText = "";
+  const last = history[history.length - 1];
+  if (last?.kind === "user") {
+    userText = last.text;
+    history.pop();
   }
 
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  return { systemPrompts, userText, history, toolResults };
 }
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
@@ -613,82 +713,146 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 
 function buildCursorRequest(
   modelId: string,
-  systemPrompt: string,
+  systemPrompts: string[],
   userText: string,
-  turns: Array<{ userText: string; assistantText: string }>,
+  history: HistoryEntry[],
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
-  // System prompt → blob store (Cursor requests it back via KV handshake)
-  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
-  const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
+  // Every `bytes` field in the *Structure messages is a sha256 blob ID —
+  // server-produced checkpoints content-address turns, user messages, and
+  // steps alike. Inlining data where an ID is expected makes Cursor fail
+  // with "Connect error internal: Blob not found" (issues #22/#29).
+  const storeBlob = (bytes: Uint8Array): Uint8Array => {
+    const blobId = new Uint8Array(createHash("sha256").update(bytes).digest());
+    blobStore.set(Buffer.from(blobId).toString("hex"), bytes);
+    return blobId;
+  };
+  const storeJsonBlob = (obj: unknown): Uint8Array =>
+    storeBlob(new TextEncoder().encode(JSON.stringify(obj)));
+
+  const prompts = systemPrompts.length > 0
+    ? systemPrompts
+    : ["You are a helpful assistant."];
+  const systemBlobIds = prompts.map((content) =>
+    storeJsonBlob({ role: "system", content }),
   );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
 
-  let conversationState;
-  if (checkpoint) {
-    conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
-  } else {
-    const turnBytes: Uint8Array[] = [];
-    for (const turn of turns) {
-      const userMsg = create(UserMessageSchema, {
-        text: turn.userText,
-        messageId: crypto.randomUUID(),
-      });
-      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-
-      const stepBytes: Uint8Array[] = [];
-      if (turn.assistantText) {
-        const step = create(ConversationStepSchema, {
-          message: {
-            case: "assistantMessage",
-            value: create(AssistantMessageSchema, { text: turn.assistantText }),
-          },
-        });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
-      }
-
-      const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBytes,
-        steps: stepBytes,
-      });
-      const turnStructure = create(ConversationTurnStructureSchema, {
-        turn: { case: "agentConversationTurn", value: agentTurn },
-      });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+  // Cursor's server builds the model prompt from `rootPromptMessagesJson`,
+  // not from `turns[]`. Sending only the system prompt here makes multi-turn
+  // conversations lose all prior context after a proxy restart, so the full
+  // history is rebuilt on every request. Server-echoed checkpoints replace
+  // historical user entries with empty placeholders, which is why the
+  // checkpoint's own rootPromptMessagesJson cannot be reused.
+  const rootPromptMessagesJson = [...systemBlobIds];
+  for (const entry of history) {
+    if (entry.kind === "assistant") {
+      rootPromptMessagesJson.push(
+        storeJsonBlob({ role: "assistant", content: [{ type: "text", text: entry.text }] }),
+      );
+    } else {
+      const text = entry.kind === "tool" ? `[Tool Result]\n${entry.text}` : entry.text;
+      rootPromptMessagesJson.push(
+        storeJsonBlob({ role: "user", content: [{ type: "text", text }] }),
+      );
     }
-
-    conversationState = create(ConversationStateStructureSchema, {
-      rootPromptMessagesJson: [systemBlobId],
-      turns: turnBytes,
-      todos: [],
-      pendingToolCalls: [],
-      previousWorkspaceUris: [],
-      fileStates: {},
-      fileStatesV2: {},
-      summaryArchives: [],
-      turnTimings: [],
-      subagentStates: {},
-      selfSummaryCount: 0,
-      readPaths: [],
-    });
   }
 
-  const userMessage = create(UserMessageSchema, {
-    text: userText,
-    messageId: crypto.randomUUID(),
-  });
-  const action = create(ConversationActionSchema, {
-    action: {
-      case: "userMessageAction",
-      value: create(UserMessageActionSchema, { userMessage }),
-    },
-  });
+  // turns[]: one entry per user turn, with assistant/tool texts as steps.
+  // Deterministic message IDs keep blob IDs stable across rebuilds.
+  const turnBlobIds: Uint8Array[] = [];
+  let currentTurn: { userMessageBlobId: Uint8Array; stepBlobIds: Uint8Array[] } | null = null;
+  const flushTurn = () => {
+    if (!currentTurn) return;
+    const agentTurn = create(AgentConversationTurnStructureSchema, {
+      userMessage: currentTurn.userMessageBlobId,
+      steps: currentTurn.stepBlobIds,
+    });
+    const turnStructure = create(ConversationTurnStructureSchema, {
+      turn: { case: "agentConversationTurn", value: agentTurn },
+    });
+    turnBlobIds.push(storeBlob(toBinary(ConversationTurnStructureSchema, turnStructure)));
+    currentTurn = null;
+  };
+  for (const entry of history) {
+    if (entry.kind === "user") {
+      flushTurn();
+      const userMsg = create(UserMessageSchema, {
+        text: entry.text,
+        messageId: deterministicUuid(`u:${turnBlobIds.length}:${entry.text}`),
+      });
+      currentTurn = {
+        userMessageBlobId: storeBlob(toBinary(UserMessageSchema, userMsg)),
+        stepBlobIds: [],
+      };
+    } else if (currentTurn) {
+      const text = entry.kind === "tool" ? `[Tool Result]\n${entry.text}` : entry.text;
+      const step = create(ConversationStepSchema, {
+        message: {
+          case: "assistantMessage",
+          value: create(AssistantMessageSchema, { text }),
+        },
+      });
+      currentTurn.stepBlobIds.push(storeBlob(toBinary(ConversationStepSchema, step)));
+    }
+  }
+  flushTurn();
+
+  // Preserve non-history checkpoint fields (todos, file states, summaries)
+  // when the system prompt is unchanged; otherwise start fresh.
+  let baseState: ConversationStateStructure | null = null;
+  if (checkpoint) {
+    try {
+      const decoded = fromBinary(ConversationStateStructureSchema, checkpoint);
+      const head = decoded.rootPromptMessagesJson.slice(0, systemBlobIds.length);
+      const matches =
+        head.length === systemBlobIds.length &&
+        systemBlobIds.every((id, idx) => Buffer.from(head[idx]!).equals(Buffer.from(id)));
+      if (matches) baseState = decoded;
+    } catch {}
+  }
+
+  const conversationState = baseState
+    ? create(ConversationStateStructureSchema, {
+        ...baseState,
+        rootPromptMessagesJson,
+        turns: turnBlobIds,
+      })
+    : create(ConversationStateStructureSchema, {
+        rootPromptMessagesJson,
+        turns: turnBlobIds,
+        todos: [],
+        pendingToolCalls: [],
+        previousWorkspaceUris: [],
+        fileStates: {},
+        fileStatesV2: {},
+        summaryArchives: [],
+        turnTimings: [],
+        subagentStates: {},
+        selfSummaryCount: 0,
+        readPaths: [],
+      });
+
+  // No trailing user message (e.g. tool results after a dead bridge) →
+  // resume over the reconstructed history instead of faking a user turn.
+  const action = userText
+    ? create(ConversationActionSchema, {
+        action: {
+          case: "userMessageAction",
+          value: create(UserMessageActionSchema, {
+            userMessage: create(UserMessageSchema, {
+              text: userText,
+              messageId: crypto.randomUUID(),
+            }),
+          }),
+        },
+      })
+    : create(ConversationActionSchema, {
+        action: { case: "resumeAction", value: create(ResumeActionSchema, {}) },
+      });
 
   const modelDetails = create(ModelDetailsSchema, {
     modelId,
@@ -711,6 +875,7 @@ function buildCursorRequest(
     requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
     blobStore,
     mcpTools: [],
+    cloudRule: prompts.join("\n\n").trim() || undefined,
   };
 }
 
@@ -839,6 +1004,7 @@ function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
@@ -855,6 +1021,7 @@ function processServerMessage(
     handleExecMessage(
       msg.message.value as ExecServerMessage,
       mcpTools,
+      cloudRule,
       sendFrame,
       onMcpExec,
     );
@@ -918,6 +1085,9 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (process.env.CURSOR_PROXY_DEBUG) {
+      console.error(`[proxy] getBlob ${blobIdKey.slice(0, 16)} ${blobData ? `hit (${blobData.length}b)` : "MISS"}`);
+    }
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -926,6 +1096,9 @@ function handleKvMessage(
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
+    if (process.env.CURSOR_PROXY_DEBUG) {
+      console.error(`[proxy] setBlob ${Buffer.from(blobId).toString("hex").slice(0, 16)} (${blobData.length}b)`);
+    }
     sendKvResponse(
       kvMsg, "setBlobResult",
       create(SetBlobResultSchema, {}),
@@ -937,14 +1110,21 @@ function handleKvMessage(
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
   const execCase = execMsg.message.case;
+  if (process.env.CURSOR_PROXY_DEBUG) {
+    console.error(`[proxy] exec: ${execCase}`);
+  }
 
   if (execCase === "requestContextArgs") {
+    // cloudRule is the prompt channel Cursor's agent actually honors; plain
+    // system messages are ignored server-side (issue #21).
     const requestContext = create(RequestContextSchema, {
       rules: [],
+      cloudRule,
       repositoryInfo: [],
       tools: mcpTools,
       gitRepos: [],
@@ -976,9 +1156,26 @@ function handleExecMessage(
     return;
   }
 
-  // --- Reject native Cursor tools ---
-  // The model tries these first. We must respond with rejection/error
-  // so it falls back to our MCP tools (registered via RequestContext).
+  // --- Native Cursor tools ---
+  // The model tries these before the MCP tools. When the client provides an
+  // equivalent tool, redirect the call to it; otherwise reject so the model
+  // falls back to the MCP tools registered via RequestContext.
+  const redirect = redirectNativeExec(execMsg, mcpTools);
+  if (redirect) {
+    if (process.env.CURSOR_PROXY_DEBUG) {
+      console.error(`[proxy] redirect ${execCase} -> ${redirect.toolName}`);
+    }
+    onMcpExec({
+      execId: execMsg.execId,
+      execMsgId: execMsg.id,
+      toolCallId: redirect.toolCallId,
+      toolName: redirect.toolName,
+      decodedArgs: redirect.decodedArgs,
+      native: redirect.binding,
+    });
+    return;
+  }
+
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "readArgs") {
@@ -1128,13 +1325,11 @@ function deriveConversationKey(messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
+/** Deterministic v4-shaped UUID from a seed (first 16 bytes of SHA-256).
+ *  Keeps conversation and message IDs stable across proxy restarts so
+ *  Cursor's server-side caches stay warm. */
+function deterministicUuid(seed: string): string {
+  const hex = createHash("sha256").update(seed).digest("hex").slice(0, 32);
   // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
   return [
     hex.slice(0, 8),
@@ -1151,6 +1346,7 @@ function createBridgeStreamResponse(
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   modelId: string,
   bridgeKey: string,
   convKey: string,
@@ -1220,6 +1416,7 @@ function createBridgeStreamResponse(
               serverMessage,
               blobStore,
               mcpTools,
+              cloudRule,
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
@@ -1259,6 +1456,7 @@ function createBridgeStreamResponse(
                   heartbeatTimer,
                   blobStore,
                   mcpTools,
+                  cloudRule,
                   pendingExecs: state.pendingExecs,
                 });
 
@@ -1270,7 +1468,11 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
+                  // Merge live blobs before persisting: the checkpoint may
+                  // reference blobs set during this stream.
+                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
                   stored.lastAccessMs = Date.now();
+                  persistConversation(convKey, stored);
                 }
               },
             );
@@ -1280,8 +1482,21 @@ function createBridgeStreamResponse(
         },
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
+          if (process.env.CURSOR_PROXY_DEBUG) {
+            console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
+          }
           if (endError) {
+            // Surface the error and shut down: the server is done with this
+            // stream, and heartbeats would otherwise keep the bridge (and the
+            // SSE response) open forever.
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+            sendSSE(makeChunk({}, "stop"));
+            sendSSE(makeUsageChunk());
+            sendDone();
+            closeController();
+            activeBridges.delete(bridgeKey);
+            clearInterval(heartbeatTimer);
+            bridge.end();
           }
         },
       );
@@ -1294,6 +1509,7 @@ function createBridgeStreamResponse(
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
+          persistConversation(convKey, stored);
         }
         if (!mcpExecReceived) {
           const flushed = tagFilter.flush();
@@ -1345,7 +1561,7 @@ function handleStreamingResponse(
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    payload.blobStore, payload.mcpTools,
+    payload.blobStore, payload.mcpTools, payload.cloudRule,
     modelId, bridgeKey, convKey,
   );
 }
@@ -1354,17 +1570,36 @@ function handleStreamingResponse(
 function handleToolResultResume(
   active: ActiveBridge,
   toolResults: ToolResultInfo[],
+  userText: string,
   modelId: string,
   bridgeKey: string,
   convKey: string,
 ): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
 
-  // Send mcpResult for each pending exec that has a matching tool result
+  // Answer each pending exec with a matching tool result: redirected native
+  // execs get their typed native result frame, MCP execs get an mcpResult.
+  const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
   for (const exec of pendingExecs) {
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
     );
+    // A user message sent alongside tool results (e.g. the explanation typed
+    // after rejecting an edit) would otherwise be dropped: the paused bridge
+    // only accepts tool results. Attach it to the last result so the model
+    // sees it (issue #23).
+    let text = result ? result.content : "Tool result not provided";
+    if (userText && exec.execId === lastExecId) {
+      text += `\n\n<user_message>\n${userText}\n</user_message>`;
+    }
+
+    if (result && exec.native) {
+      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
+        bridge.write(frameConnectMessage(bytes)),
+      );
+      if (sent) continue;
+    }
+
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -1374,7 +1609,7 @@ function handleToolResultResume(
                 create(McpToolResultContentItemSchema, {
                   content: {
                     case: "text",
-                    value: create(McpTextContentSchema, { text: result.content }),
+                    value: create(McpTextContentSchema, { text }),
                   },
                 }),
               ],
@@ -1385,7 +1620,7 @@ function handleToolResultResume(
       : create(McpResultSchema, {
           result: {
             case: "error",
-            value: create(McpErrorSchema, { error: "Tool result not provided" }),
+            value: create(McpErrorSchema, { error: text }),
           },
         });
 
@@ -1393,8 +1628,8 @@ function handleToolResultResume(
       id: exec.execMsgId,
       execId: exec.execId,
       message: {
-        case: "mcpResult" as any,
-        value: mcpResult as any,
+        case: "mcpResult" as never,
+        value: mcpResult as never,
       },
     });
 
@@ -1409,7 +1644,7 @@ function handleToolResultResume(
 
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
-    blobStore, mcpTools,
+    blobStore, mcpTools, cloudRule,
     modelId, bridgeKey, convKey,
   );
 }
@@ -1477,6 +1712,7 @@ async function collectFullResponse(
           serverMessage,
           payload.blobStore,
           payload.mcpTools,
+          payload.cloudRule,
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
@@ -1489,7 +1725,9 @@ async function collectFullResponse(
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
+              for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               stored.lastAccessMs = Date.now();
+              persistConversation(convKey, stored);
             }
           },
         );
@@ -1506,6 +1744,7 @@ async function collectFullResponse(
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
+      persistConversation(convKey, stored);
     }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
