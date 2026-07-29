@@ -12,20 +12,15 @@ Add this to `~/.config/opencode/opencode.json`:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     "opencode-cursor-oauth"
-  ],
-  "provider": {
-    "cursor": {
-      "name": "Cursor"
-    }
-  }
+  ]
 }
 ```
 
-The `cursor` provider stub is required because OpenCode drops providers that do
-not already exist in its bundled provider catalog.
+The plugin registers the `cursor` provider and its models automatically once
+you are logged in — no manual `provider` stub or model list is needed.
 
-OpenCode installs npm plugins automatically at startup, so users do not need to
-clone this repository.
+OpenCode installs npm plugins automatically at startup, so users do not need
+to clone this repository.
 
 ## Authenticate
 
@@ -47,8 +42,9 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 2. Model discovery — queries Cursor's gRPC API for all available models.
 3. Local proxy — translates `POST /v1/chat/completions` into Cursor's
    protobuf/HTTP/2 Connect protocol.
-4. Native tool routing — rejects Cursor's built-in filesystem/shell tools and
-   exposes OpenCode's tool surface via Cursor MCP instead.
+4. Native tool routing — redirects Cursor's built-in filesystem/shell tools
+   to the equivalent OpenCode tools, and exposes OpenCode's tool surface via
+   Cursor MCP.
 
 HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
 Bun's `node:http2` support is not reliable against Cursor's API.
@@ -70,13 +66,24 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 
 ```
 1. Cursor model receives OpenAI tools via RequestContext (as MCP tool defs)
-2. Model tries native tools (readArgs, shellArgs, etc.)
-3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
-4. Model falls back to MCP tool -> mcpArgs exec message
-5. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
-6. OpenCode executes tool, sends result in follow-up request
-7. Proxy resumes H2 stream with mcpResult, streams continuation
+2. Model calls a tool:
+   - native tools (readArgs, shellArgs, grepArgs, ...) with an OpenCode
+     equivalent are redirected to it (read, bash, grep, glob, webfetch, write)
+   - native tools without an equivalent are rejected with a typed error
+   - MCP tools arrive as mcpArgs exec messages
+3. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
+4. OpenCode executes tool, sends result in follow-up request
+5. Proxy resumes H2 stream with the typed native result (or mcpResult),
+   streams continuation
 ```
+
+### Conversation state
+
+Conversation history is rebuilt from the OpenAI messages on every request
+(`rootPromptMessagesJson` + content-addressed turn blobs), and server
+checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
+context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
+handshake and exec traffic when debugging.
 
 ## Develop locally
 
