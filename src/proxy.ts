@@ -49,6 +49,7 @@ import {
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
+  RequestedModelSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   ResumeActionSchema,
@@ -854,16 +855,25 @@ function buildCursorRequest(
         action: { case: "resumeAction", value: create(ResumeActionSchema, {}) },
       });
 
+  // "auto" is the proxy's pseudo-model for Cursor's server-side Auto
+  // routing; the Run API expects modelId "default" for it.
+  const cursorModelId = modelId === "auto" ? "default" : modelId;
+  const displayName = modelId === "auto" ? "Auto" : modelId;
+  const requestedModel = create(RequestedModelSchema, {
+    modelId: cursorModelId,
+  });
   const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
+    modelId: cursorModelId,
+    displayModelId: cursorModelId,
+    displayName,
+    displayNameShort: displayName,
   });
 
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
     modelDetails,
+    requestedModel,
     conversationId,
   });
 
