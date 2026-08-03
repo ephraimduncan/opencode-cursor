@@ -1364,10 +1364,10 @@ function createBridgeStreamResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
+  let closed = false;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
@@ -1541,6 +1541,9 @@ function createBridgeStreamResponse(
           activeBridges.delete(bridgeKey);
         }
       });
+    },
+    cancel() {
+      closed = true;
     },
   });
 
