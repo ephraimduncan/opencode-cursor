@@ -308,7 +308,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
   });
 
   const config = JSON.stringify({
@@ -318,6 +318,20 @@ function spawnBridge(options: SpawnBridgeOptions): {
     unary: options.unary ?? false,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+
+  // Forward stderr to console for debugging. Without this, bridge errors
+  // are silently swallowed and the proxy appears to hang for no reason.
+  (async () => {
+    try {
+      const reader = proc.stderr.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = new TextDecoder().decode(value);
+        if (text.trim()) console.error(`[h2-bridge] ${text.trimEnd()}`);
+      }
+    } catch {}
+  })();
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,

@@ -98,12 +98,15 @@ function resetTimeout() {
 
 function killBridge() {
   clearTimeout(timeout);
-  client.destroy();
+  try { client.destroy(); } catch {}
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (err) => {
   clearTimeout(timeout);
+  // Write the error to stderr so the parent process can see it.
+  // Without this, errors are silently swallowed.
+  try { process.stderr.write(`[h2-bridge] client error: ${err.message}\n`); } catch {}
   process.exit(1);
 });
 
@@ -136,9 +139,10 @@ h2Stream.on("end", () => {
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
+h2Stream.on("error", (err) => {
   clearTimeout(timeout);
-  client.close();
+  try { process.stderr.write(`[h2-bridge] stream error: ${err.message}\n`); } catch {}
+  try { client.close(); } catch {}
   process.exit(1);
 });
 
