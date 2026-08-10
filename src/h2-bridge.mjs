@@ -34,12 +34,17 @@ function boundedDuration(name, fallback, maximum) {
   return Number.isFinite(value) && value > 0 ? Math.min(value, maximum) : fallback;
 }
 
-/** Write one length-prefixed message to stdout. */
-function writeMessage(data) {
+/** Write one typed length-prefixed message to stdout. */
+function writeMessage(kind, data) {
+  const payload = Buffer.concat([Buffer.from([kind]), Buffer.from(data)]);
   const lenBuf = Buffer.alloc(4);
-  lenBuf.writeUInt32BE(data.length, 0);
+  lenBuf.writeUInt32BE(payload.length, 0);
   process.stdout.write(lenBuf);
-  process.stdout.write(data);
+  process.stdout.write(payload);
+}
+
+function writeTransportStatus(transport) {
+  writeMessage(1, Buffer.from(JSON.stringify({ transport })));
 }
 
 // --- Buffered stdin reader ---
@@ -156,6 +161,7 @@ function sendPing() {
 
 client.on("connect", () => {
   emitDiagnostic("h2_connect");
+  writeTransportStatus("writable");
   // PING validates the HTTP/2/TCP path, not model output. A 15s cadence and
   // 10s response window leave normal multi-minute model thinking untouched.
   pingInterval = setInterval(sendPing, pingIntervalMs);
@@ -180,6 +186,7 @@ let failed = false;
 function failBridge(errorName) {
   if (failed || cleanExit) return;
   failed = true;
+  writeTransportStatus("failed");
   clearLivenessTimers();
   emitDiagnostic("terminal", { errorName, exitCode: 1 });
   try { client.destroy(); } catch {}
@@ -234,7 +241,7 @@ h2Stream.on("data", (chunk) => {
   resetTimeout();
   observeConnectFrames(chunk);
   emitDiagnostic("bridge_data", { byteLength: chunk.length });
-  writeMessage(chunk);
+  writeMessage(0, chunk);
 });
 
 h2Stream.on("end", () => {
@@ -243,6 +250,7 @@ h2Stream.on("end", () => {
     failBridge("ConnectProtocolError");
   }
   cleanExit = true;
+  writeTransportStatus("closed");
   emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
   // Give stdout time to flush

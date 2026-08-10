@@ -221,13 +221,14 @@ interface PendingNativeExec {
  * Convert the redirected tool's text result into the typed native result the
  * paused exec expects. Returns false when no faithful conversion exists
  * (caller falls back to an mcpResult).
- * `sendMessage` receives an unframed AgentClientMessage binary.
+ * `sendMessage` receives an unframed AgentClientMessage binary and must report
+ * whether the retained transport accepted it.
  */
 export function sendNativeExecResult(
   exec: PendingNativeExec,
   binding: NativeExecBinding,
   text: string,
-  sendMessage: (bytes: Uint8Array) => void,
+  sendMessage: (bytes: Uint8Array) => boolean,
 ): boolean {
   const args = binding.args;
 
@@ -243,7 +244,9 @@ export function sendNativeExecResult(
     const clientMessage = create(AgentClientMessageSchema, {
       message: { case: "execClientMessage", value: execClientMessage },
     });
-    sendMessage(toBinary(AgentClientMessageSchema, clientMessage));
+    if (!sendMessage(toBinary(AgentClientMessageSchema, clientMessage))) {
+      throw new Error("Failed to write native tool result to Cursor bridge");
+    }
   };
 
   switch (binding.resultType) {
@@ -353,7 +356,9 @@ export function sendNativeExecResult(
       const clientMessage = create(AgentClientMessageSchema, {
         message: { case: "execClientControlMessage", value: controlMessage },
       });
-      sendMessage(toBinary(AgentClientMessageSchema, clientMessage));
+      if (!sendMessage(toBinary(AgentClientMessageSchema, clientMessage))) {
+        throw new Error("Failed to write native tool result to Cursor bridge");
+      }
       return true;
     }
 

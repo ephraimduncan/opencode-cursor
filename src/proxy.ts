@@ -157,6 +157,10 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
+  /** Opaque proxy-generated handle; never derived from caller content. */
+  resumeId: string;
+  /** Cursor tool-call identifiers that resolve this exact paused interaction. */
+  toolCallIds: Set<string>;
   bridge: ReturnType<typeof spawnBridge>;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
@@ -165,10 +169,11 @@ interface ActiveBridge {
   pendingExecs: PendingExec[];
 }
 
-// Active bridges keyed by a session token (derived from conversation state).
-// When tool_calls are returned, the bridge stays alive. The next request
-// with tool results looks up the bridge and sends mcpResult messages.
+// Active bridges are keyed by an opaque, per-pause UUID. A separate index maps
+// Cursor's tool-call identifiers back to that UUID on the follow-up request.
+// Message content is deliberately not part of resume identity.
 const activeBridges = new Map<string, ActiveBridge>();
+const activeBridgeToolCalls = new Map<string, string>();
 
 interface StoredConversation {
   conversationId: string;
@@ -316,6 +321,8 @@ function spawnBridge(options: SpawnBridgeOptions): {
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
   get alive(): boolean;
+  /** True only after the child reports a live, writable HTTP/2 transport. */
+  get writable(): boolean;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
@@ -390,6 +397,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   // Track exit state so late onClose registrations fire immediately.
   let exited = false;
   let exitCode = 1;
+  let writable = false;
 
   (async () => {
     const reader = proc.stdout.getReader();
@@ -406,7 +414,19 @@ function spawnBridge(options: SpawnBridgeOptions): {
           if (pending.length < 4 + len) break;
           const payload = pending.subarray(4, 4 + len);
           pending = pending.subarray(4 + len);
-          cbs.data?.(Buffer.from(payload));
+          // The child reserves the first byte for pipe-level control. H2 data
+          // remains opaque to this layer; control records only establish whether
+          // a retained bridge can safely accept a tool-result resume.
+          if (payload[0] === 1) {
+            try {
+              const status = JSON.parse(payload.subarray(1).toString("utf8"));
+              writable = status.transport === "writable";
+            } catch {
+              writable = false;
+            }
+          } else if (payload[0] === 0) {
+            cbs.data?.(Buffer.from(payload.subarray(1)));
+          }
         }
       }
     } catch {
@@ -422,6 +442,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   return {
     proc,
     get alive() { return !exited; },
+    get writable() { return !exited && writable; },
     write(data) {
       if (exited) return false;
       try {
@@ -525,6 +546,11 @@ function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }
 
 export function getProxyPort(): number | undefined {
   return proxyPort;
+}
+
+/** Visible for lifecycle assertions; retained bridges are never resumable after termination. */
+export function getActiveBridgeCount(): number {
+  return activeBridges.size;
 }
 
 export async function startProxy(
@@ -639,18 +665,19 @@ async function handleChatCompletion(
     );
   }
 
-  // bridgeKey: model-specific, for active tool-call bridges
-  // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
+  // A tool-result request has no trustworthy conversation ID in OpenAI's wire
+  // shape. Its tool_call_id is the only identifier bound to the paused server
+  // interaction, so resolve exclusively through that index and fail closed on
+  // missing, ambiguous, or conflicting IDs.
   const convKey = deriveConversationKey(body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
+  const activeBridge = findPausedBridge(toolResults);
 
   if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+    removeActiveBridge(activeBridge);
 
-    if (activeBridge.bridge.alive) {
+    if (activeBridge.bridge.writable) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, userText, modelId, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -660,10 +687,10 @@ async function handleChatCompletion(
   }
 
   // Clean up stale bridge if present
-  if (activeBridge && activeBridges.has(bridgeKey)) {
+  if (activeBridge && activeBridges.has(activeBridge.resumeId)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    removeActiveBridge(activeBridge);
   }
 
   let stored = conversationStates.get(convKey);
@@ -693,7 +720,7 @@ async function handleChatCompletion(
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, convKey);
 }
 
 interface ToolResultInfo {
@@ -1467,14 +1494,23 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
-    .digest("hex")
-    .slice(0, 16);
+function removeActiveBridge(active: ActiveBridge): void {
+  if (activeBridges.get(active.resumeId) === active) {
+    activeBridges.delete(active.resumeId);
+  }
+  for (const toolCallId of active.toolCallIds) {
+    if (activeBridgeToolCalls.get(toolCallId) === active.resumeId) {
+      activeBridgeToolCalls.delete(toolCallId);
+    }
+  }
+}
+
+function findPausedBridge(toolResults: ToolResultInfo[]): ActiveBridge | undefined {
+  if (toolResults.length === 0 || toolResults.some((result) => !result.toolCallId)) return undefined;
+  const resumeIds = new Set(toolResults.map((result) => activeBridgeToolCalls.get(result.toolCallId)));
+  if (resumeIds.size !== 1) return undefined;
+  const resumeId = resumeIds.values().next().value;
+  return typeof resumeId === "string" ? activeBridges.get(resumeId) : undefined;
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
@@ -1510,7 +1546,6 @@ function createBridgeStreamResponse(
   mcpTools: McpToolDefinition[],
   cloudRule: string | undefined,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1578,7 +1613,9 @@ function createBridgeStreamResponse(
         if (terminal) return;
         terminal = true;
         clearInterval(heartbeatTimer);
-        activeBridges.delete(bridgeKey);
+        for (const active of activeBridges.values()) {
+          if (active.bridge === bridge) removeActiveBridge(active);
+        }
 
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1595,7 +1632,9 @@ function createBridgeStreamResponse(
         if (terminal) return;
         terminal = true;
         clearInterval(heartbeatTimer);
-        activeBridges.delete(bridgeKey);
+        for (const active of activeBridges.values()) {
+          if (active.bridge === bridge) removeActiveBridge(active);
+        }
         bridge.terminate();
       };
 
@@ -1648,15 +1687,27 @@ function createBridgeStreamResponse(
                   }],
                 }));
 
-                // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
+                // The server-issued tool-call ID identifies this paused
+                // interaction. Refuse a duplicate instead of overwriting an
+                // unrelated bridge and risking cross-conversation routing.
+                const existingResumeId = activeBridgeToolCalls.get(exec.toolCallId);
+                if (existingResumeId) {
+                  finishTerminal(new Error("Cursor tool-call identity is already paused"));
+                  return;
+                }
+                const resumeId = crypto.randomUUID();
+                const active: ActiveBridge = {
+                  resumeId,
+                  toolCallIds: new Set([exec.toolCallId]),
                   bridge,
                   heartbeatTimer,
                   blobStore,
                   mcpTools,
                   cloudRule,
                   pendingExecs: state.pendingExecs,
-                });
+                };
+                activeBridges.set(resumeId, active);
+                activeBridgeToolCalls.set(exec.toolCallId, resumeId);
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
@@ -1721,7 +1772,9 @@ function createBridgeStreamResponse(
           // Tool pause deliberately owns neither terminal cleanup nor bridge
           // shutdown. Once the retained bridge itself exits, it is stale on
           // either exit code and must no longer be resumable.
-          activeBridges.delete(bridgeKey);
+          for (const active of activeBridges.values()) {
+            if (active.bridge === bridge) removeActiveBridge(active);
+          }
           return;
         }
 
@@ -1764,14 +1817,13 @@ function handleStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools, payload.cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, convKey,
   );
 }
 
@@ -1781,7 +1833,6 @@ function handleToolResultResume(
   toolResults: ToolResultInfo[],
   userText: string,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
@@ -1852,11 +1903,17 @@ function handleToolResultResume(
     );
   }
 
-  return createBridgeStreamResponse(
+  try {
+    return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
-    modelId, bridgeKey, convKey,
-  );
+    modelId, convKey,
+    );
+  } catch (error) {
+    clearInterval(heartbeatTimer);
+    bridge.terminate();
+    throw error;
+  }
 }
 
 async function handleNonStreamingResponse(

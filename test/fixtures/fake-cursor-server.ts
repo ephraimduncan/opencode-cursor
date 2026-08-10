@@ -35,7 +35,8 @@ export type CursorScenario =
   | "silent-transport"
   | "transport-death"
   | "tool-pause-resume"
-  | "tool-pause-transport-death";
+  | "tool-pause-transport-death"
+  | "tool-pause-clean-exit";
 
 export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "clean-end-stream",
@@ -59,6 +60,7 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "transport-death",
   "tool-pause-resume",
   "tool-pause-transport-death",
+  "tool-pause-clean-exit",
 ] as const;
 
 export interface FakeCursorServer {
@@ -214,7 +216,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
     stream.once("close", finish);
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
 
-    if (scenario === "tool-pause-resume" || scenario === "tool-pause-transport-death") {
+    if (scenario === "tool-pause-resume" || scenario === "tool-pause-transport-death" || scenario === "tool-pause-clean-exit") {
       const toolCallId = `fixture-call-${++toolPauseCount}`;
       let receivedInitialRequest = false;
       let paused = false;
@@ -226,6 +228,8 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
           if (scenario === "tool-pause-transport-death") {
             const session = stream.session;
             setTimeout(() => session.destroy(), 10);
+          } else if (scenario === "tool-pause-clean-exit") {
+            setTimeout(() => stream.end(frameConnectEndStream(new TextEncoder().encode("{}"))), 10);
           }
           return;
         }

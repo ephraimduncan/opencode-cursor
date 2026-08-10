@@ -28,6 +28,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  getActiveBridgeCount: typeof import("../src/proxy").getActiveBridgeCount;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -252,6 +253,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    getActiveBridgeCount: proxy.getActiveBridgeCount,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -750,6 +752,23 @@ async function testServerMessageClassification(modules: TestModules) {
     writeFailure = error instanceof Error ? error : new Error(String(error));
   }
   assertEqual(writeFailure?.message, "bridge write rejected", "Bridge write failures must propagate to the terminal owner");
+  const { sendNativeExecResult } = await import("../src/native-tools");
+  let nativeWriteFailure: Error | undefined;
+  try {
+    sendNativeExecResult(
+      { execId: "dead-bridge", execMsgId: 1 },
+      { resultType: "readResult", args: { path: "/tmp/never-written" } },
+      "unreachable",
+      () => false,
+    );
+  } catch (error) {
+    nativeWriteFailure = error instanceof Error ? error : new Error(String(error));
+  }
+  assertEqual(
+    nativeWriteFailure?.message,
+    "Failed to write native tool result to Cursor bridge",
+    "A dead bridge must explicitly reject native tool-result writes",
+  );
   console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
 }
 
@@ -807,7 +826,7 @@ async function observeToolResume(
       { role: "tool", tool_call_id: firstCall, content: "result-for-" + firstCall },
     ]));
     stopProxy();
-    console.log(JSON.stringify({ first, second, secondCall, resumed }));
+    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed }));
     process.exit(0);
   `);
 }
@@ -860,7 +879,7 @@ async function observeNonStreamingStall(apiUrl: string): Promise<Record<string, 
   `);
 }
 
-async function testResumeRefreshAndNonStreamingKnownFailures() {
+async function testResumeRefreshAndNonStreamingKnownFailures(modules: TestModules) {
   console.log("[test] Reproducing quarantined resume, refresh, and collection failures...");
   const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   try {
@@ -882,11 +901,19 @@ async function testResumeRefreshAndNonStreamingKnownFailures() {
 
     fixture.setScenario("tool-pause-resume");
     const collision = await observeToolResume(fixture.apiUrl, "tool-pause-resume", true);
-    await expectKnownFailure(
-      "same-opening conversations retain isolated paused bridges",
-      async () => assert(String((collision.resumed as { text?: string }).text ?? "").includes("resumed-correctly"), "A resume must reach its own paused bridge"),
-      () => `observed secondCall=${String(collision.secondCall)}, body=${JSON.stringify((collision.resumed as { text?: string }).text ?? "")}`,
+    assert(
+      collision.secondCall !== undefined && collision.secondCall !== collision.firstCall,
+      "Identical-opening conversations must receive distinct paused tool-call identities",
     );
+    assert(
+      String((collision.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "An identical-opening conversation must resume its own paused bridge",
+    );
+    assert(
+      !String((collision.resumed as { text?: string }).text ?? "").includes("resumed-with-wrong-result"),
+      "A tool result must never resume a different identical-opening conversation",
+    );
+    console.log("[test] Identical-opening conversations retain isolated paused bridges");
 
     fixture.setScenario("tool-pause-transport-death");
     const droppedWrite = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
@@ -894,7 +921,28 @@ async function testResumeRefreshAndNonStreamingKnownFailures() {
       String((droppedWrite.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
       "A closed transport must not accept a dropped resume write as a live bridge",
     );
-    console.log("[test] Closed-stream fixture does not reproduce a silent dropped write; child exit triggers fallback");
+    assert(
+      !String((droppedWrite.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "A dead bridge must reject its pending result rather than accepting a stale write",
+    );
+    console.log("[test] Closed-stream bridge rejects stale writes and resumes through a fresh request");
+
+    fixture.setScenario("tool-pause-clean-exit");
+    const port = await modules.startProxy(async () => "test-token");
+    const paused = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "test", stream: true,
+        messages: [{ role: "user", content: "paused bridge cleanup" }],
+        tools: [{ type: "function", function: { name: "fixture-tool", parameters: { type: "object" } } }],
+      }),
+    });
+    await paused.text();
+    await Bun.sleep(40);
+    assertEqual(modules.getActiveBridgeCount(), 0, "A clean terminal path must remove its paused bridge entry");
+    modules.stopProxy();
+    console.log("[test] Clean paused-bridge exit removes its active bridge entry");
   } finally {
     await fixture.close();
   }
@@ -1132,7 +1180,7 @@ async function main() {
     await testFakeCursorScenarioHarness();
     await testStreamingTerminationKnownFailures();
     await testServerMessageClassification(modules);
-    await testResumeRefreshAndNonStreamingKnownFailures();
+    await testResumeRefreshAndNonStreamingKnownFailures(modules);
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
