@@ -6,6 +6,11 @@ import {
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
+import {
+  CURSOR_SCENARIOS,
+  createFakeCursorServer,
+  type CursorScenario,
+} from "./fixtures/fake-cursor-server";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -420,6 +425,69 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Array content parsing OK");
 }
 
+async function runFakeScenario(apiUrl: string, scenario: CursorScenario): Promise<Buffer> {
+  const session = http2.connect(apiUrl);
+  const stream = session.request({
+    ":method": "POST",
+    ":path": "/agent.v1.AgentService/Run",
+    "x-fake-cursor-scenario": scenario,
+  });
+  const chunks: Buffer[] = [];
+  return new Promise<Buffer>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stream.close(http2.constants.NGHTTP2_CANCEL);
+      session.destroy();
+      reject(new Error(`Fixture scenario exceeded its deadline: ${scenario}`));
+    }, 500);
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      session.destroy();
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks));
+    };
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.once("end", () => finish());
+    stream.once("close", () => finish());
+    stream.once("error", () => finish());
+    stream.end();
+  });
+}
+
+async function testFakeCursorScenarioHarness() {
+  console.log("[test] Testing bounded fake Cursor scenario harness...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 100 });
+  try {
+    for (const scenario of CURSOR_SCENARIOS) {
+      fixture.setScenario(scenario);
+      await runFakeScenario(fixture.apiUrl, scenario);
+    }
+
+    fixture.trackChild(4242);
+    let caughtLeak = false;
+    try {
+      fixture.assertClean();
+    } catch (error) {
+      caughtLeak = error instanceof Error && error.message.includes("child process");
+    }
+    assert(caughtLeak, "Fixture cleanup assertion did not detect a deliberately leaked child");
+    fixture.untrackChild(4242);
+    fixture.trackBridgeEntry("deliberate-leak");
+    let caughtBridgeLeak = false;
+    try {
+      fixture.assertClean();
+    } catch (error) {
+      caughtBridgeLeak = error instanceof Error && error.message.includes("bridge map entry");
+    }
+    assert(caughtBridgeLeak, "Fixture cleanup assertion did not detect a deliberately leaked bridge entry");
+    fixture.untrackBridgeEntry("deliberate-leak");
+    await Bun.sleep(25);
+    fixture.assertClean();
+  } finally {
+    await fixture.close();
+  }
+  console.log(`[test] Fake Cursor scenarios selectable (${CURSOR_SCENARIOS.length}) and cleanup assertions OK`);
+}
+
 async function testLifecycleDiagnostics(modules: TestModules) {
   console.log("[test] Testing redacted lifecycle diagnostics...");
   const originalSetting = process.env.CURSOR_PROXY_DIAGNOSTICS;
@@ -615,6 +683,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
+    await testFakeCursorScenarioHarness();
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
