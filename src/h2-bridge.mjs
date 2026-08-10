@@ -150,15 +150,37 @@ if (!unary) {
 const h2Stream = client.request(headers);
 emitDiagnostic("connect_stream");
 
+const CONNECT_END_STREAM_FLAG = 0b00000010;
+let connectFrameBuffer = Buffer.alloc(0);
+let sawConnectEndStream = false;
+
+function observeConnectFrames(chunk) {
+  if (unary) return;
+  connectFrameBuffer = Buffer.concat([connectFrameBuffer, chunk]);
+  while (connectFrameBuffer.length >= 5) {
+    const flags = connectFrameBuffer[0];
+    const messageLength = connectFrameBuffer.readUInt32BE(1);
+    if (connectFrameBuffer.length < 5 + messageLength) return;
+    connectFrameBuffer = connectFrameBuffer.subarray(5 + messageLength);
+    if (flags & CONNECT_END_STREAM_FLAG) sawConnectEndStream = true;
+  }
+}
+
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
   resetTimeout();
+  observeConnectFrames(chunk);
   emitDiagnostic("bridge_data", { byteLength: chunk.length });
   writeMessage(chunk);
 });
 
 h2Stream.on("end", () => {
   clearTimeout(timeout);
+  if (!unary && !sawConnectEndStream) {
+    emitDiagnostic("terminal", { errorName: "ConnectProtocolError", exitCode: 1 });
+    try { client.close(); } catch {}
+    process.exit(1);
+  }
   emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
   // Give stdout time to flush

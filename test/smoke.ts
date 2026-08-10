@@ -493,6 +493,10 @@ interface SseObservation {
   timedOut: boolean;
 }
 
+function doneCount(body: string): number {
+  return body.split("data: [DONE]").length - 1;
+}
+
 async function observeProxyScenario(scenario: CursorScenario, deadlineMs = 125): Promise<SseObservation> {
   const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   fixture.setScenario(scenario);
@@ -562,49 +566,44 @@ async function testStreamingTerminationKnownFailures() {
 
   const cleanEnd = await observeProxyScenario("clean-end-stream-kept-open");
   assert(!cleanEnd.timedOut && cleanEnd.body.includes("data: [DONE]"), "Clean end-stream must finish in the local H2 fixture");
+  assertEqual(doneCount(cleanEnd.body), 1, "Clean end-stream must emit exactly one [DONE]");
   console.log("[test] Valid end-stream does not reproduce as an open SSE: bridge exit cascades to [DONE]");
 
+  const errorEnd = await observeProxyScenario("error-end-stream");
+  assert(errorEnd.body.includes("Connect error unavailable: fixture failure"), "Connect end-stream errors must preserve their code and message");
+  assertEqual(doneCount(errorEnd.body), 1, "Connect end-stream errors must emit exactly one [DONE]");
+  console.log("[test] Connect end-stream errors propagate exactly once");
+
   const emptyEnd = await observeProxyScenario("empty-end-stream");
-  await expectKnownFailure(
-    "empty end-stream is clean success",
-    async () => assert(!emptyEnd.body.includes("[Error:"), "Empty end-stream must not emit an error"),
-    () => `observed error=${emptyEnd.body.match(/\[Error:[^\]]+/)?.[0] ?? "none"}`,
-  );
+  assert(!emptyEnd.timedOut, "Empty end-stream must terminate");
+  assert(!emptyEnd.body.includes("[Error:"), "Empty end-stream must not emit an error");
+  assertEqual(doneCount(emptyEnd.body), 1, "Empty end-stream must emit exactly one [DONE]");
+  console.log("[test] Empty end-stream completes cleanly exactly once");
 
   const missingEnd = await observeProxyScenario("missing-end-stream");
-  await expectKnownFailure(
-    "missing end-stream is explicit failure",
-    async () => assert(missingEnd.body.includes("[Error:"), "Missing end-stream must be surfaced as an error"),
-    () => `observed done=${missingEnd.body.includes("data: [DONE]")}, error=${missingEnd.body.includes("[Error:")}`,
-  );
+  assert(missingEnd.body.includes("[Error:"), "Missing end-stream must be surfaced as an error");
+  assertEqual(doneCount(missingEnd.body), 1, "Missing end-stream must emit exactly one [DONE]");
+  console.log("[test] Missing end-stream is an explicit error exactly once");
 
   const bridgeExit = await observeProxyScenario("frame-error");
-  await expectKnownFailure(
-    "bridge exit is not clean success",
-    async () => assert(bridgeExit.body.includes("[Error:"), "Bridge exit must be surfaced as an error"),
-    () => `observed done=${bridgeExit.body.includes("data: [DONE]")}, finishStop=${bridgeExit.body.includes('"finish_reason":"stop"')}, error=${bridgeExit.body.includes("[Error:")}`,
-  );
+  assert(bridgeExit.body.includes("[Error:"), "Bridge exit must be surfaced as an error");
+  assertEqual(doneCount(bridgeExit.body), 1, "Bridge exit must emit exactly one [DONE]");
+  console.log("[test] Bridge exit is an explicit error exactly once");
 
   const malformedTerminal = await observeProxyScenario("malformed-terminal");
-  await expectKnownFailure(
-    "malformed terminal frame is explicit failure",
-    async () => assert(malformedTerminal.body.includes("[Error:"), "Malformed terminal frame must be surfaced as an error"),
-    () => `observed done=${malformedTerminal.body.includes("data: [DONE]")}, error=${malformedTerminal.body.includes("[Error:")}`,
-  );
+  assert(malformedTerminal.body.includes("[Error:"), "Malformed terminal frame must be surfaced as an error");
+  assertEqual(doneCount(malformedTerminal.body), 1, "Malformed terminal frame must emit exactly one [DONE]");
+  console.log("[test] Malformed terminal frame is an explicit error exactly once");
 
   const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open");
-  await expectKnownFailure(
-    "heartbeat-only trickle cannot defer termination indefinitely",
-    async () => assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal"),
-    () => `observed timedOut=${heartbeatTrickle.timedOut}, semanticSse=${heartbeatTrickle.body.includes('"content"')}, done=${heartbeatTrickle.body.includes("data: [DONE]")}`,
-  );
+  assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal after transport closure");
+  assertEqual(doneCount(heartbeatTrickle.body), 1, "Heartbeat-only transport closure must emit exactly one [DONE]");
+  console.log("[test] Heartbeat-only transport closure is an explicit error exactly once");
 
   const turnEnded = await observeProxyScenario("turn-ended-kept-open");
-  await expectKnownFailure(
-    "turnEnded has a classified terminal response",
-    async () => assert(turnEnded.body.includes("[Error:"), "turnEnded must not become a clean transport-close success"),
-    () => `observed timedOut=${turnEnded.timedOut}, done=${turnEnded.body.includes("data: [DONE]")}, emittedBytes=${turnEnded.body.length}`,
-  );
+  assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
+  assertEqual(doneCount(turnEnded.body), 1, "turnEnded transport closure must emit exactly one [DONE]");
+  console.log("[test] turnEnded transport closure is an explicit error exactly once");
 
   const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
   assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");

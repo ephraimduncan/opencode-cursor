@@ -945,6 +945,8 @@ function buildCursorRequest(
 }
 
 function parseConnectEndStream(data: Uint8Array): Error | null {
+  if (data.length === 0) return null;
+
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
@@ -1418,6 +1420,7 @@ function createBridgeStreamResponse(
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  let cancelStream = () => {};
 
   const stream = new ReadableStream({
     start(controller) {
@@ -1471,6 +1474,32 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let connectEndStreamReceived = false;
+      let terminal = false;
+
+      const finishTerminal = (error?: Error) => {
+        if (terminal) return;
+        terminal = true;
+        clearInterval(heartbeatTimer);
+
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        if (error) sendSSE(makeChunk({ content: `\n[Error: ${error.message}]` }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        activeBridges.delete(bridgeKey);
+      };
+
+      cancelStream = () => {
+        if (terminal) return;
+        terminal = true;
+        clearInterval(heartbeatTimer);
+        activeBridges.delete(bridgeKey);
+        bridge.end();
+      };
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
@@ -1556,6 +1585,7 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
+          connectEndStreamReceived = true;
           const endError = parseConnectEndStream(endStreamBytes);
           emitLifecycleDiagnostic("proxy", "end_stream", {
             byteLength: endStreamBytes.length,
@@ -1564,19 +1594,8 @@ function createBridgeStreamResponse(
           if (process.env.CURSOR_PROXY_DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }
-          if (endError) {
-            // Surface the error and shut down: the server is done with this
-            // stream, and heartbeats would otherwise keep the bridge (and the
-            // SSE response) open forever.
-            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeController();
-            activeBridges.delete(bridgeKey);
-            clearInterval(heartbeatTimer);
-            bridge.end();
-          }
+          finishTerminal(endError ?? undefined);
+          bridge.end();
         },
       );
 
@@ -1591,26 +1610,26 @@ function createBridgeStreamResponse(
           stored.lastAccessMs = Date.now();
           persistConversation(convKey, stored);
         }
-        if (!mcpExecReceived) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
-          // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
-          activeBridges.delete(bridgeKey);
+        if (terminal) return;
+        if (mcpExecReceived) {
+          if (code !== 0) activeBridges.delete(bridgeKey);
+          return;
         }
+
+        if (!connectEndStreamReceived) {
+          finishTerminal(new Error(
+            code === 0
+              ? "Connect stream ended without end-of-stream frame"
+              : `Bridge exited with code ${code} before Connect end-stream`,
+          ));
+          return;
+        }
+
+        finishTerminal(new Error(`Bridge exited with code ${code} after Connect end-stream`));
       });
+    },
+    cancel() {
+      cancelStream();
     },
   });
 
