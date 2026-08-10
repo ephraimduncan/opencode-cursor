@@ -80,6 +80,7 @@ import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
 import {
+  CursorTokenRefreshTimeoutError,
   emitLifecycleDiagnostic,
   lifecycleDiagnosticContextInfo,
   lifecycleDiagnosticsEnabled,
@@ -565,9 +566,19 @@ export async function startProxy(
               errorName: err instanceof Error ? err.name : "UnknownError",
             });
             const message = err instanceof Error ? err.message : String(err);
+            const refreshTimedOut = err instanceof CursorTokenRefreshTimeoutError;
             return new Response(
-              JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }),
-              { status: 500, headers: { "Content-Type": "application/json" } },
+              JSON.stringify({
+                error: {
+                  message,
+                  type: refreshTimedOut ? "gateway_timeout" : "server_error",
+                  code: refreshTimedOut ? "token_refresh_timeout" : "internal_error",
+                },
+              }),
+              {
+                status: refreshTimedOut ? 504 : 500,
+                headers: { "Content-Type": "application/json" },
+              },
             );
           }
         });

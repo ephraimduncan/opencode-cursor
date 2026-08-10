@@ -11,6 +11,21 @@ const POLL_MAX_ATTEMPTS = 150;
 const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
+const DEFAULT_REFRESH_TIMEOUT_MS = 15_000;
+const MAX_REFRESH_TIMEOUT_MS = 60_000;
+
+export class CursorTokenRefreshTimeoutError extends Error {
+  constructor() {
+    super("Cursor token refresh timed out; retry the request or sign in again");
+    this.name = "CursorTokenRefreshTimeoutError";
+  }
+}
+
+function getRefreshTimeoutMs(): number {
+  const configured = Number(process.env.CURSOR_REFRESH_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_REFRESH_TIMEOUT_MS;
+  return Math.min(Math.floor(configured), MAX_REFRESH_TIMEOUT_MS);
+}
 
 const lifecycleDiagnosticContext = new AsyncLocalStorage<{
   requestId: string;
@@ -146,22 +161,33 @@ export async function refreshCursorToken(
   refreshToken: string,
 ): Promise<CursorCredentials> {
   emitLifecycleDiagnostic("auth", "auth_refresh_start");
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, getRefreshTimeoutMs());
   let response: Response;
   try {
     response = await fetch(CURSOR_REFRESH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${refreshToken}`, "Content-Type": "application/json" },
       body: "{}",
+      signal: controller.signal,
     });
   } catch (error) {
-    emitLifecycleDiagnostic("auth", "auth_refresh_failed", { errorName: error instanceof Error ? error.name : "UnknownError" });
-    throw error;
+    const refreshError = timedOut
+      ? new CursorTokenRefreshTimeoutError()
+      : new Error("Cursor token refresh request failed");
+    emitLifecycleDiagnostic("auth", "auth_refresh_failed", { errorName: refreshError.name });
+    throw refreshError;
+  } finally {
+    clearTimeout(timeout);
   }
 
   if (!response.ok) {
     emitLifecycleDiagnostic("auth", "auth_refresh_failed", { exitCode: response.status });
-    const error = await response.text();
-    throw new Error(`Cursor token refresh failed: ${error}`);
+    throw new Error(`Cursor token refresh failed with HTTP status ${response.status}`);
   }
 
   const data = (await response.json()) as {

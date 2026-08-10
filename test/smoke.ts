@@ -792,12 +792,34 @@ async function observeStalledRefresh(): Promise<Record<string, unknown>> {
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     const port = server.address().port;
     process.env.CURSOR_REFRESH_URL = "http://127.0.0.1:" + port + "/auth/exchange_user_api_key";
+    process.env.CURSOR_REFRESH_TIMEOUT_MS = "25";
     const { refreshCursorToken } = await import("./src/auth.ts");
     const { startProxy, stopProxy } = await import("./src/proxy.ts");
     const proxyPort = await startProxy(async () => (await refreshCursorToken("stalled-refresh")).access);
     const pending = fetch("http://localhost:" + proxyPort + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "refresh stall" }] }) });
-    const result = await Promise.race([pending.then(() => ({ headersReturned: true })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
+    const result = await Promise.race([pending.then(async response => ({ headersReturned: true, status: response.status, body: await response.json() })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
     stopProxy(); server.close(); console.log(JSON.stringify(result)); process.exit(0);
+  `);
+}
+
+async function observeSuccessfulRefresh(): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess("http://127.0.0.1:1", `
+    import http from "node:http";
+    const server = http.createServer((req, res) => {
+      if (req.headers.authorization !== "Bearer valid-refresh") throw new Error("unexpected refresh authorization");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ accessToken: "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDAwMDAwMDB9.fakesig", refreshToken: "rotated-refresh" }));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    process.env.CURSOR_REFRESH_URL = "http://127.0.0.1:" + server.address().port + "/auth/exchange_user_api_key";
+    process.env.CURSOR_REFRESH_TIMEOUT_MS = "25";
+    const { refreshCursorToken } = await import("./src/auth.ts");
+    const refreshed = await refreshCursorToken("valid-refresh");
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    console.log(JSON.stringify({
+      accessMatches: refreshed.access === "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDAwMDAwMDB9.fakesig",
+      refreshMatches: refreshed.refresh === "rotated-refresh",
+    }));
   `);
 }
 
@@ -851,11 +873,18 @@ async function testResumeRefreshAndNonStreamingKnownFailures() {
   }
 
   const refresh = await observeStalledRefresh();
-  await expectKnownFailure(
-    "stalled token refresh returns headers or an error",
-    async () => assert(refresh.headersReturned === true, "Refresh stall must not leave the request pre-header"),
-    () => `observed headersReturned=${String(refresh.headersReturned)}`,
-  );
+  assert(refresh.headersReturned === true, "Refresh stall must not leave the request pre-header");
+  assertEqual(refresh.status, 504, "Refresh timeout must return Gateway Timeout");
+  const refreshError = refresh.body as { error?: { message?: string; type?: string; code?: string } };
+  assertEqual(refreshError.error?.type, "gateway_timeout", "Refresh timeout must be a structured timeout error");
+  assertEqual(refreshError.error?.code, "token_refresh_timeout", "Refresh timeout must identify the refresh boundary");
+  assert(!JSON.stringify(refreshError).includes("stalled-refresh"), "Refresh timeout errors must not expose refresh credentials");
+  console.log("[test] Stalled token refresh returns a bounded, redacted structured error");
+
+  const successfulRefresh = await observeSuccessfulRefresh();
+  assertEqual(successfulRefresh.accessMatches, true, "Successful refresh must preserve the access token");
+  assertEqual(successfulRefresh.refreshMatches, true, "Successful refresh must preserve a rotated refresh token");
+  console.log("[test] Successful token refresh completes within the configured bound");
 
   const collectionFixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   try {
