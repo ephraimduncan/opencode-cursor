@@ -31,6 +31,8 @@ export type CursorScenario =
   | "abrupt-session-close"
   | "frame-error"
   | "goaway"
+  | "stream-aborted"
+  | "silent-transport"
   | "transport-death"
   | "tool-pause-resume"
   | "tool-pause-transport-death";
@@ -52,6 +54,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "abrupt-session-close",
   "frame-error",
   "goaway",
+  "stream-aborted",
+  "silent-transport",
   "transport-death",
   "tool-pause-resume",
   "tool-pause-transport-death",
@@ -320,6 +324,15 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       case "goaway":
         stream.write(frameConnectMessage(textDelta("before-goaway")));
         setTimeout(() => stream.session.goaway(http2.constants.NGHTTP2_NO_ERROR), 10);
+        break;
+      case "stream-aborted":
+        stream.write(frameConnectMessage(textDelta("before-abort")));
+        setTimeout(() => stream.close(http2.constants.NGHTTP2_CANCEL), 10);
+        break;
+      case "silent-transport":
+        // Keep the H2 connection open without emitting frames. Tests lower the
+        // client session bound while disabling the first PING to exercise its
+        // explicit timeout path without waiting for production timings.
         break;
       case "transport-death":
         setTimeout(() => stream.session.destroy(), 10);

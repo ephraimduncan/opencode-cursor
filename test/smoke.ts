@@ -539,7 +539,11 @@ function doneCount(body: string): number {
   return body.split("data: [DONE]").length - 1;
 }
 
-async function observeProxyScenario(scenario: CursorScenario, deadlineMs = 125): Promise<SseObservation> {
+async function observeProxyScenario(
+  scenario: CursorScenario,
+  deadlineMs = 125,
+  environment: Record<string, string> = {},
+): Promise<SseObservation> {
   const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   fixture.setScenario(scenario);
   const childScript = `
@@ -571,7 +575,7 @@ async function observeProxyScenario(scenario: CursorScenario, deadlineMs = 125):
   const child = Bun.spawn({
     cmd: [process.execPath, "-e", childScript],
     cwd: process.cwd(),
-    env: { ...process.env, CURSOR_API_URL: fixture.apiUrl },
+    env: { ...process.env, CURSOR_API_URL: fixture.apiUrl, ...environment },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -646,6 +650,29 @@ async function testStreamingTerminationKnownFailures() {
   assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
   assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
   console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+
+  const frameError = await observeProxyScenario("frame-error");
+  assert(frameError.body.includes("[Error:"), "HTTP/2 frame errors must be surfaced as an error");
+  assertEqual(doneCount(frameError.body), 1, "HTTP/2 frame errors must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 frame errors are explicit exactly once");
+
+  const goaway = await observeProxyScenario("goaway");
+  assert(goaway.body.includes("[Error:"), "HTTP/2 GOAWAY must be surfaced as an error");
+  assertEqual(doneCount(goaway.body), 1, "HTTP/2 GOAWAY must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 GOAWAY is explicit exactly once");
+
+  const aborted = await observeProxyScenario("stream-aborted");
+  assert(aborted.body.includes("[Error:"), "Aborted HTTP/2 streams must be surfaced as an error");
+  assertEqual(doneCount(aborted.body), 1, "Aborted HTTP/2 streams must emit exactly one [DONE]");
+  console.log("[test] Aborted HTTP/2 streams are explicit exactly once");
+
+  const sessionTimeout = await observeProxyScenario("silent-transport", 250, {
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(sessionTimeout.body.includes("[Error:"), "HTTP/2 session timeout must be surfaced as an error");
+  assertEqual(doneCount(sessionTimeout.body), 1, "HTTP/2 session timeout must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 session timeout is explicit exactly once");
 
   const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open");
   assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal after transport closure");

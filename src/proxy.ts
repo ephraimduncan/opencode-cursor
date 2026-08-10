@@ -365,7 +365,16 @@ function spawnBridge(options: SpawnBridgeOptions): {
             for (const key of ["parentElapsedMs", "byteLength", "status", "exitCode"] as const) {
               if (typeof parsed[key] === "number") event[key] = parsed[key];
             }
-            if (typeof parsed.errorName === "string") event.errorName = parsed.errorName;
+            const allowedBridgeErrorNames = new Set([
+              "Timeout:connect", "Timeout:idle", "ConnectProtocolError", "BridgeWriteError",
+              "PingTimeout", "PingFailure", "Http2SessionError", "Http2Goaway",
+              "Http2FrameError", "Http2SessionTimeout", "Http2SessionClose",
+              "Http2StreamError", "Http2StreamAborted", "Http2StreamClose",
+            ]);
+            if (
+              typeof parsed.errorName === "string" &&
+              allowedBridgeErrorNames.has(parsed.errorName)
+            ) event.errorName = parsed.errorName;
             console.error(JSON.stringify(event));
           } catch {}
         }

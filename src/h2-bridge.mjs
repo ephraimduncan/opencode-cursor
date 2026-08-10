@@ -22,6 +22,17 @@ import http2 from "node:http2";
 import crypto from "node:crypto";
 
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+const DEFAULT_PING_INTERVAL_MS = 15_000;
+const DEFAULT_PING_TIMEOUT_MS = 10_000;
+const DEFAULT_SESSION_TIMEOUT_MS = 120_000;
+const MAX_PING_INTERVAL_MS = 300_000;
+const MAX_PING_TIMEOUT_MS = 60_000;
+const MAX_SESSION_TIMEOUT_MS = 600_000;
+
+function boundedDuration(name, fallback, maximum) {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? Math.min(value, maximum) : fallback;
+}
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
@@ -99,15 +110,56 @@ function emitDiagnostic(stage, details = {}) {
     elapsedMs: Math.round(performance.now() - diagnosticStartedAt),
     parentElapsedMs: diagnosticContext.elapsedMs,
   };
-  for (const key of ["byteLength", "status", "exitCode"])
+  for (const key of ["byteLength", "exitCode"])
     if (typeof details[key] === "number") event[key] = details[key];
+  if (typeof details.status === "string") event.status = details.status;
   if (typeof details.errorName === "string") event.errorName = details.errorName;
   try { process.stderr.write(`${JSON.stringify(event)}\n`); } catch {}
 }
 emitDiagnostic("bridge_start");
 
 const client = http2.connect(url || "https://api2.cursor.sh");
-client.on("connect", () => emitDiagnostic("h2_connect"));
+const pingIntervalMs = boundedDuration(
+  "CURSOR_BRIDGE_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS, MAX_PING_INTERVAL_MS,
+);
+const pingTimeoutMs = boundedDuration(
+  "CURSOR_BRIDGE_PING_TIMEOUT_MS", DEFAULT_PING_TIMEOUT_MS, MAX_PING_TIMEOUT_MS,
+);
+const sessionTimeoutMs = boundedDuration(
+  "CURSOR_BRIDGE_SESSION_TIMEOUT_MS", DEFAULT_SESSION_TIMEOUT_MS, MAX_SESSION_TIMEOUT_MS,
+);
+let pingInterval;
+let pingTimeout;
+let cleanExit = false;
+
+function clearLivenessTimers() {
+  clearTimeout(timeout);
+  if (pingInterval) clearInterval(pingInterval);
+  if (pingTimeout) clearTimeout(pingTimeout);
+  pingInterval = undefined;
+  pingTimeout = undefined;
+}
+
+function sendPing() {
+  if (failed || cleanExit || pingTimeout) return;
+  try {
+    pingTimeout = setTimeout(() => failBridge("PingTimeout"), pingTimeoutMs);
+    client.ping((error) => {
+      if (pingTimeout) clearTimeout(pingTimeout);
+      pingTimeout = undefined;
+      if (error) failBridge("PingFailure");
+    });
+  } catch {
+    failBridge("PingFailure");
+  }
+}
+
+client.on("connect", () => {
+  emitDiagnostic("h2_connect");
+  // PING validates the HTTP/2/TCP path, not model output. A 15s cadence and
+  // 10s response window leave normal multi-minute model thinking untouched.
+  pingInterval = setInterval(sendPing, pingIntervalMs);
+});
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
@@ -126,17 +178,23 @@ function killBridge(reason = "connect") {
 
 let failed = false;
 function failBridge(errorName) {
-  if (failed) return;
+  if (failed || cleanExit) return;
   failed = true;
-  clearTimeout(timeout);
+  clearLivenessTimers();
   emitDiagnostic("terminal", { errorName, exitCode: 1 });
   try { client.destroy(); } catch {}
   process.exit(1);
 }
 
-client.on("error", (err) => {
-  failBridge(err?.name || "Error");
+client.on("error", () => failBridge("Http2SessionError"));
+
+client.on("goaway", () => failBridge("Http2Goaway"));
+client.on("frameError", () => failBridge("Http2FrameError"));
+client.on("timeout", () => failBridge("Http2SessionTimeout"));
+client.on("close", () => {
+  if (!cleanExit) failBridge("Http2SessionClose");
 });
+client.setTimeout(sessionTimeoutMs);
 
 const headers = {
   ":method": "POST",
@@ -180,10 +238,11 @@ h2Stream.on("data", (chunk) => {
 });
 
 h2Stream.on("end", () => {
-  clearTimeout(timeout);
+  clearLivenessTimers();
   if (!unary && !sawConnectEndStream) {
     failBridge("ConnectProtocolError");
   }
+  cleanExit = true;
   emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
   // Give stdout time to flush
@@ -191,7 +250,11 @@ h2Stream.on("end", () => {
 });
 
 h2Stream.on("error", (err) => {
-  failBridge(err?.name || "Error");
+  failBridge("Http2StreamError");
+});
+h2Stream.on("aborted", () => failBridge("Http2StreamAborted"));
+h2Stream.on("close", () => {
+  if (!cleanExit) failBridge("Http2StreamClose");
 });
 
 // Forward stdin → H2 stream (after config message)
