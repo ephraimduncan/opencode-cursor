@@ -488,6 +488,134 @@ async function testFakeCursorScenarioHarness() {
   console.log(`[test] Fake Cursor scenarios selectable (${CURSOR_SCENARIOS.length}) and cleanup assertions OK`);
 }
 
+interface SseObservation {
+  body: string;
+  timedOut: boolean;
+}
+
+async function observeProxyScenario(scenario: CursorScenario, deadlineMs = 125): Promise<SseObservation> {
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario(scenario);
+  const childScript = `
+    import { startProxy, stopProxy } from "./src/proxy.ts";
+    const port = await startProxy(async () => "test-token");
+    const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "reproduce termination behavior" }] }),
+    });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    const drain = (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return { body, timedOut: false };
+        body += decoder.decode(value, { stream: true });
+      }
+    })();
+    const result = await Promise.race([
+      drain,
+      new Promise((resolve) => setTimeout(() => resolve({ body, timedOut: true }), ${deadlineMs})),
+    ]);
+    void reader.cancel().catch(() => {});
+    stopProxy();
+    console.log(JSON.stringify(result));
+  `;
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", childScript],
+    cwd: process.cwd(),
+    env: { ...process.env, CURSOR_API_URL: fixture.apiUrl },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    assertEqual(exitCode, 0, `Scenario subprocess failed (${scenario}): ${stderr}`);
+    return JSON.parse(stdout.trim()) as SseObservation;
+  } finally {
+    await fixture.close();
+  }
+}
+
+async function expectKnownFailure(
+  label: string,
+  expectedBehavior: () => Promise<void>,
+  observed: () => string,
+) {
+  try {
+    await expectedBehavior();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`[known-failure] ${label}: ${observed()} (${message})`);
+    return;
+  }
+  throw new Error(`Known failure unexpectedly passed: ${label}; remove its quarantine and make it required`);
+}
+
+async function testStreamingTerminationKnownFailures() {
+  console.log("[test] Reproducing quarantined streaming termination failures...");
+
+  const cleanEnd = await observeProxyScenario("clean-end-stream-kept-open");
+  assert(!cleanEnd.timedOut && cleanEnd.body.includes("data: [DONE]"), "Clean end-stream must finish in the local H2 fixture");
+  console.log("[test] Valid end-stream does not reproduce as an open SSE: bridge exit cascades to [DONE]");
+
+  const emptyEnd = await observeProxyScenario("empty-end-stream");
+  await expectKnownFailure(
+    "empty end-stream is clean success",
+    async () => assert(!emptyEnd.body.includes("[Error:"), "Empty end-stream must not emit an error"),
+    () => `observed error=${emptyEnd.body.match(/\[Error:[^\]]+/)?.[0] ?? "none"}`,
+  );
+
+  const missingEnd = await observeProxyScenario("missing-end-stream");
+  await expectKnownFailure(
+    "missing end-stream is explicit failure",
+    async () => assert(missingEnd.body.includes("[Error:"), "Missing end-stream must be surfaced as an error"),
+    () => `observed done=${missingEnd.body.includes("data: [DONE]")}, error=${missingEnd.body.includes("[Error:")}`,
+  );
+
+  const bridgeExit = await observeProxyScenario("frame-error");
+  await expectKnownFailure(
+    "bridge exit is not clean success",
+    async () => assert(bridgeExit.body.includes("[Error:"), "Bridge exit must be surfaced as an error"),
+    () => `observed done=${bridgeExit.body.includes("data: [DONE]")}, finishStop=${bridgeExit.body.includes('"finish_reason":"stop"')}, error=${bridgeExit.body.includes("[Error:")}`,
+  );
+
+  const malformedTerminal = await observeProxyScenario("malformed-terminal");
+  await expectKnownFailure(
+    "malformed terminal frame is explicit failure",
+    async () => assert(malformedTerminal.body.includes("[Error:"), "Malformed terminal frame must be surfaced as an error"),
+    () => `observed done=${malformedTerminal.body.includes("data: [DONE]")}, error=${malformedTerminal.body.includes("[Error:")}`,
+  );
+
+  const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open");
+  await expectKnownFailure(
+    "heartbeat-only trickle cannot defer termination indefinitely",
+    async () => assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal"),
+    () => `observed timedOut=${heartbeatTrickle.timedOut}, semanticSse=${heartbeatTrickle.body.includes('"content"')}, done=${heartbeatTrickle.body.includes("data: [DONE]")}`,
+  );
+
+  const turnEnded = await observeProxyScenario("turn-ended-kept-open");
+  await expectKnownFailure(
+    "turnEnded has a classified terminal response",
+    async () => assert(turnEnded.body.includes("[Error:"), "turnEnded must not become a clean transport-close success"),
+    () => `observed timedOut=${turnEnded.timedOut}, done=${turnEnded.body.includes("data: [DONE]")}, emittedBytes=${turnEnded.body.length}`,
+  );
+
+  const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
+  assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");
+  assert(!slowProgress.body.includes("[Error:"), "Slow semantic progress must not emit an error");
+  for (const part of ["part-1", "part-2", "part-3"]) {
+    assert(slowProgress.body.includes(part), `Slow semantic progress lost ${part}`);
+  }
+  assert(slowProgress.body.includes("data: [DONE]"), "Slow semantic progress must finish normally");
+  console.log("[test] Slow semantic progress survives bounded streaming completion");
+}
+
 async function testLifecycleDiagnostics(modules: TestModules) {
   console.log("[test] Testing redacted lifecycle diagnostics...");
   const originalSetting = process.env.CURSOR_PROXY_DIAGNOSTICS;
@@ -684,6 +812,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testFakeCursorScenarioHarness();
+    await testStreamingTerminationKnownFailures();
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

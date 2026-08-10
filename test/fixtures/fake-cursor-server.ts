@@ -7,12 +7,14 @@ import {
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
   TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../../src/proto/agent_pb";
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 
 export type CursorScenario =
   | "clean-end-stream"
+  | "clean-end-stream-kept-open"
   | "error-end-stream"
   | "empty-end-stream"
   | "missing-end-stream"
@@ -20,6 +22,8 @@ export type CursorScenario =
   | "partial-frame"
   | "slow-semantic-progress"
   | "heartbeat-trickle"
+  | "heartbeat-trickle-kept-open"
+  | "turn-ended-kept-open"
   | "checkpoint-trickle"
   | "abrupt-session-close"
   | "frame-error"
@@ -28,6 +32,7 @@ export type CursorScenario =
 
 export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "clean-end-stream",
+  "clean-end-stream-kept-open",
   "error-end-stream",
   "empty-end-stream",
   "missing-end-stream",
@@ -35,6 +40,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "partial-frame",
   "slow-semantic-progress",
   "heartbeat-trickle",
+  "heartbeat-trickle-kept-open",
+  "turn-ended-kept-open",
   "checkpoint-trickle",
   "abrupt-session-close",
   "frame-error",
@@ -103,6 +110,17 @@ function heartbeat(): Buffer {
   });
 }
 
+function turnEnded(): Buffer {
+  return serverMessage({
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+      }),
+    },
+  });
+}
+
 function checkpoint(): Buffer {
   return serverMessage({
     message: {
@@ -131,11 +149,13 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
 
   server.on("session", (session) => {
     sessions.add(session);
+    session.on("error", () => {});
     session.once("close", () => sessions.delete(session));
   });
 
   server.on("stream", (stream, headers) => {
     streams.add(stream);
+    stream.on("error", () => {});
     stream.once("close", () => streams.delete(stream));
     stream.resume();
     if (headers[":path"] !== "/agent.v1.AgentService/Run") {
@@ -171,10 +191,19 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
         stream.write(frameConnectMessage(payload));
       }, 10);
     };
+    const trickleUntilClosed = (payload: Buffer) => {
+      const interval = setInterval(() => {
+        if (stream.closed || stream.destroyed) return clearInterval(interval);
+        stream.write(frameConnectMessage(payload));
+      }, 10);
+    };
 
     switch (scenario) {
       case "clean-end-stream":
         stream.end(Buffer.concat([frameConnectMessage(textDelta("complete")), frameConnectEndStream(new TextEncoder().encode("{}"))]));
+        break;
+      case "clean-end-stream-kept-open":
+        stream.write(frameConnectEndStream(new TextEncoder().encode("{}")));
         break;
       case "error-end-stream":
         endWith(new TextEncoder().encode(JSON.stringify({ error: { code: "unavailable", message: "fixture failure" } })));
@@ -205,6 +234,12 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       }
       case "heartbeat-trickle":
         trickle(heartbeat());
+        break;
+      case "heartbeat-trickle-kept-open":
+        trickleUntilClosed(heartbeat());
+        break;
+      case "turn-ended-kept-open":
+        stream.write(frameConnectMessage(turnEnded()));
         break;
       case "checkpoint-trickle":
         trickle(checkpoint());

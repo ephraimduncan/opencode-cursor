@@ -408,3 +408,27 @@ proxy and child records can be ordered across the process boundary.
 case names, tool counts, status/exit codes, and error class names. Tokens, authorization
 headers, prompt text, tool arguments/results, and blob/checkpoint IDs are never serialized
 (`src/auth.ts:48-67`; parent drain filter `src/proxy.ts:344-365`).
+
+## 2.10 Runtime reproduction verdicts
+
+The local fake Connect/HTTP2 backend now drives the proxy through isolated terminal sequences.
+Each subprocess and fixture owns a deadline; the full smoke suite completes in about 7.8 seconds.
+The intentionally failing assertions are quarantined in `test/smoke.ts`: they report their
+observed baseline without making the smoke command fail. The fixture cannot prove what a live
+Cursor server chooses to send; it can prove the proxy's response to each wire sequence below.
+
+| Candidate | Verdict | Harness evidence |
+|---|---|---|
+| Valid JSON end-stream is a no-op | **DOES NOT REPRODUCE as an open client SSE** | A `{}` end-stream followed by the local H2 lifecycle produced `[DONE]` through the bridge-exit cascade. The parser/caller no-op remains source-proven, but this fixture cannot keep the Node bridge open after that sequence, so it does not establish an externally visible hang. |
+| Empty end-stream body | **REPRODUCES** | The clean zero-byte terminal produced `[Error: Failed to parse Connect end stream]`; the quarantined assertion requires a clean completion. |
+| Missing end-stream | **REPRODUCES** | A text frame followed by transport EOF produced `[DONE]` and `finish_reason:"stop"`, with no error content. The required explicit protocol error assertion fails. |
+| Non-zero bridge exit | **REPRODUCES** | An HTTP/2 protocol reset produced `[DONE]` plus `finish_reason:"stop"`, without error content. This is the false-success path reported upstream. |
+| Malformed terminal frame | **REPRODUCES** | A terminal frame with an advertised length larger than its payload produced clean `[DONE]`, with no error content. The client receives silent truncation rather than a protocol error. |
+| Heartbeat-only trickle | **REPRODUCES** | Repeated valid heartbeat frames generated no semantic SSE content. The fixture deadline finally forced transport closure, after which the proxy emitted clean `[DONE]` rather than an error. Because both bridge activity resets occur on every inbound byte/write, an unbounded producer can repeat this sequence indefinitely; the test fixture bounds the proof at one second so CI cannot hang. |
+| `turnEnded` | **REPRODUCES as silent loss; live Cursor semantics remain deferred** | A valid `turnEnded` frame generated zero semantic SSE bytes, then the fixture deadline forced a clean `[DONE]` transport-close cascade. This proves local dropping and false success, not that real Cursor uses `turnEnded` as its terminal signal or sends it in this order. |
+| Slow semantic progress | **PASSES** | Three delayed text deltas (`part-1` through `part-3`) all reached SSE and completed with `[DONE]` without an error. Any later liveness fix must preserve this behavior. |
+
+These results resolve the terminal-matrix runtime rows for T1, T3, T5, T9, and the
+heartbeat/`turnEnded` portions of T10 as harness-confirmed. T6's precise Node GOAWAY/session
+event ordering remains **unknown-needs-runtime-evidence**, since the local fixture cannot claim
+that its event sequence matches Cursor's production transport.
