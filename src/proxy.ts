@@ -1557,6 +1557,10 @@ function createBridgeStreamResponse(
         },
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
+          emitLifecycleDiagnostic("proxy", "end_stream", {
+            byteLength: endStreamBytes.length,
+            status: endError ? "error" : "clean",
+          });
           if (process.env.CURSOR_PROXY_DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }

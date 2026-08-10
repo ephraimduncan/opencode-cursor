@@ -21,12 +21,13 @@ const lifecycleDiagnosticContext = new AsyncLocalStorage<{
 export type LifecycleDiagnosticStage =
   | "auth_access_start" | "auth_access_complete"
   | "auth_refresh_start" | "auth_refresh_complete" | "auth_refresh_failed"
-  | "proxy_entry" | "bridge_spawn" | "connect_frame" | "message_dispatch"
+  | "proxy_entry" | "bridge_spawn" | "connect_frame" | "end_stream"
+  | "message_dispatch"
   | "tool_pause" | "tool_resume" | "sse_emission" | "terminal";
 
 type LifecycleDiagnosticDetails = Readonly<{
   byteLength?: number; messageCase?: string; interactionCase?: string;
-  toolCount?: number; exitCode?: number; errorName?: string;
+  toolCount?: number; exitCode?: number; errorName?: string; status?: string;
 }>;
 
 /** Diagnostics are opt-in because even safe metadata is operational noise. */
@@ -62,6 +63,7 @@ export function emitLifecycleDiagnostic(
   if (typeof details.toolCount === "number") event.toolCount = details.toolCount;
   if (typeof details.exitCode === "number") event.exitCode = details.exitCode;
   if (typeof details.errorName === "string") event.errorName = details.errorName;
+  if (typeof details.status === "string") event.status = details.status;
   console.error(JSON.stringify(event));
 }
 

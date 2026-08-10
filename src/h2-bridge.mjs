@@ -111,15 +111,18 @@ client.on("connect", () => emitDiagnostic("h2_connect"));
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+let timeoutReason = "connect";
+let timeout = setTimeout(() => killBridge(timeoutReason), 30_000);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeoutReason = "idle";
+  timeout = setTimeout(() => killBridge(timeoutReason), 120_000);
 }
 
-function killBridge() {
+function killBridge(reason = "connect") {
   clearTimeout(timeout);
+  emitDiagnostic("terminal", { errorName: `Timeout:${reason}`, exitCode: 1 });
   try { client.destroy(); } catch {}
   process.exit(1);
 }
