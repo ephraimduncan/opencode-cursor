@@ -318,11 +318,11 @@ Bridge retention starts at tool pause (`proxy.ts:1523-1530`); lookup and eligibi
 
 | # | Scenario | Route | Outcome | Classification |
 |---|---|---|---|---|
-| R1 | Live healthy resume | `activeBridges.get` → `alive` true → `handleToolResultResume` (`proxy.ts:615-617`) | mcpResult/native frames sent per `pendingExec` (`1661-1721`); a new `createBridgeStreamResponse` streams the rest (`1723-1727`) | **terminates cleanly when transport healthy** — source-proven |
-| R2 | Process-alive but transport-dead bridge resume | eligibility checks only `alive` = process existence (`proxy.ts:410`, `615`) | writes silently dropped at F6 (`h2-bridge.mjs:194-196`) → resumed SSE never receives data → HANG (bounded ~255s streaming truncation) | **HANGS (risk)** — liveness gap source-proven; frequency runtime |
+| R1 | Live healthy resume | `activeBridges.get` → `alive` true → `handleToolResultResume` (`proxy.ts:615-617`) | mcpResult/native frames sent per `pendingExec` (`1661-1721`); a new `createBridgeStreamResponse` streams the rest (`1723-1727`) | **terminates cleanly when transport healthy** — harness-confirmed: the paused bridge received its matching result and emitted `resumed-correctly` plus `[DONE]`. |
+| R2 | Process-alive but transport-dead bridge resume | eligibility checks only `alive` = process existence (`proxy.ts:410`, `615`) | writes silently dropped at F6 (`h2-bridge.mjs:194-196`) → resumed SSE never receives data → HANG (bounded ~255s streaming truncation) | **HANGS (risk)** — liveness gap source-proven. The real H2 close fixture does **not** reproduce this exact state: the child exits, `alive` becomes false, and the proxy takes the fresh-request fallback. An alive child with a closed stream remains runtime-deferred. |
 | R3 | Dead-bridge resume (process exited) | `alive` false → cleanup + `bridge.end()` + fresh request (`proxy.ts:619-624`) with `resumeAction` over reconstructed history (`909-911`) | context preserved; fresh bridge path | **terminates via fresh path** — source-proven |
-| R4 | Bridge-key collision | `deriveBridgeKey` = sha256(model + first 200 chars of first user message) (`proxy.ts:1374-1381`) | two conversations with the same model+opening map to one `activeBridges` slot; the second pause overwrites the first entry without ending the first bridge (`1523-1530`) and `pendingExecs` are shared | **collision risk** — keying source-proven; consequences runtime |
-| R5 | Dropped write during resume (child mid-exit race) | F5/F6 | result frame lost silently → resumed stream never progresses | **HANGS (risk)** — source-proven |
+| R4 | Bridge-key collision | `deriveBridgeKey` = sha256(model + first 200 chars of first user message) (`proxy.ts:1374-1381`) | two conversations with the same model+opening map to one `activeBridges` slot; the second pause overwrites the first entry without ending the first bridge (`1523-1530`) and `pendingExecs` are shared | **REPRODUCES** — harness-confirmed: resuming conversation A after conversation B paused sent A's result to B; B observed `resumed-with-wrong-result` and a clean `[DONE]`. Required behavior is per-conversation bridge isolation or an explicit error, never cross-conversation routing. |
+| R5 | Dropped write during resume (child mid-exit race) | F5/F6 | result frame lost silently → resumed stream never progresses | **HANGS (risk)** — source-proven. The H2 close fixture does **not** reproduce a silent write: the child exits before resume and the proxy starts a fresh request. The process-alive write-drop race remains runtime-deferred. |
 | R6 | Pause with no resume (abandoned tool call) | no TTL on `activeBridges`; only `stopProxy` clears (`578-582`) | bridge + heartbeat + H2 session leak indefinitely (§2.2 T8) | **leak** — source-proven |
 
 ## 2.7 Verdicts on the five known mechanisms
@@ -432,3 +432,22 @@ These results resolve the terminal-matrix runtime rows for T1, T3, T5, T9, and t
 heartbeat/`turnEnded` portions of T10 as harness-confirmed. T6's precise Node GOAWAY/session
 event ordering remains **unknown-needs-runtime-evidence**, since the local fixture cannot claim
 that its event sequence matches Cursor's production transport.
+
+## 2.11 Resume, refresh, and non-streaming reproduction verdicts
+
+The same bounded local fixture now exercises the tool-call continuation boundary. Expected
+defects remain quarantined in the smoke output; a fresh request and a healthy continuation remain
+ordinary passing assertions.
+
+| Candidate | Verdict | Harness evidence and required behavior |
+|---|---|---|
+| Live resume | **DOES NOT REPRODUCE** | A paused bridge received its matching tool result and emitted `resumed-correctly` followed by `[DONE]`. Later liveness work must preserve this path. |
+| Dead resume | **DOES NOT REPRODUCE for a real H2 close** | Destroying the fixture session caused the Node child to exit. On resume, `alive` was false and the proxy started a fresh request, which returned a new `tool_calls` response. The exact process-alive/stream-dead state is still source-proven as a risk but runtime-deferred; correct behavior there is fresh fallback or an explicit error, never a silent write. |
+| Bridge-key collision | **REPRODUCES** | Two paused conversations sharing the same model and first user-message prefix occupied one key. Resuming the first delivered its result to the second bridge, observed as `resumed-with-wrong-result` and clean `[DONE]`. Correct behavior requires distinct conversation identity in the bridge key or an explicit collision error. |
+| Dropped resume write | **DOES NOT REPRODUCE for a real H2 close** | The close fixture exits the child before the proxy writes, so the fresh-request fallback wins. F5/F6 still prove that a process-alive write can be swallowed; a transport-dead-but-process-alive fixture is required to make that externally observable. Correct behavior is an explicit caller error and cleanup/fresh fallback. |
+| Stalled token refresh | **REPRODUCES** | A local refresh endpoint accepted the request and never replied. After 125ms, the proxy request had returned no headers (`headersReturned=false`). Correct behavior is a bounded refresh failure before a client can wait indefinitely. |
+| Non-streaming collection | **REPRODUCES** | A heartbeat-trickle fixture never ended the bridge; after 125ms the `stream:false` request still had no headers (`headersReturned=false`). Correct behavior is a bounded explicit terminal response independent of streaming SSE handling. |
+
+The bounded suite remains safe: subprocesses exit after recording each 125ms observation, and
+the fake server closes every tracked session and stream. No production source seam was added for
+these reproductions.

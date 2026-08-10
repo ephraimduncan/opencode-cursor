@@ -4,8 +4,10 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
+  ExecServerMessageSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  McpArgsSchema,
   TextDeltaUpdateSchema,
   TurnEndedUpdateSchema,
 } from "../../src/proto/agent_pb";
@@ -28,7 +30,9 @@ export type CursorScenario =
   | "abrupt-session-close"
   | "frame-error"
   | "goaway"
-  | "transport-death";
+  | "transport-death"
+  | "tool-pause-resume"
+  | "tool-pause-transport-death";
 
 export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "clean-end-stream",
@@ -47,6 +51,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "frame-error",
   "goaway",
   "transport-death",
+  "tool-pause-resume",
+  "tool-pause-transport-death",
 ] as const;
 
 export interface FakeCursorServer {
@@ -130,6 +136,28 @@ function checkpoint(): Buffer {
   });
 }
 
+function toolPause(toolCallId: string): Buffer {
+  return serverMessage({
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id: 1,
+        execId: `fixture-exec-${toolCallId}`,
+        message: {
+          case: "mcpArgs",
+          value: create(McpArgsSchema, {
+            name: "fixture-tool",
+            toolName: "fixture-tool",
+            toolCallId,
+            providerIdentifier: "fixture",
+            args: { input: new TextEncoder().encode("{}") },
+          }),
+        },
+      }),
+    },
+  });
+}
+
 function isScenario(value: string): value is CursorScenario {
   return (CURSOR_SCENARIOS as readonly string[]).includes(value);
 }
@@ -146,6 +174,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
   const childPids = new Set<number>();
   const bridgeEntries = new Set<string>();
   let defaultScenario: CursorScenario = "clean-end-stream";
+  let toolPauseCount = 0;
 
   server.on("session", (session) => {
     sessions.add(session);
@@ -178,6 +207,34 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
     };
     stream.once("close", finish);
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+
+    if (scenario === "tool-pause-resume" || scenario === "tool-pause-transport-death") {
+      const toolCallId = `fixture-call-${++toolPauseCount}`;
+      let receivedInitialRequest = false;
+      let paused = false;
+      stream.on("data", (chunk) => {
+        if (!receivedInitialRequest) {
+          receivedInitialRequest = true;
+          paused = true;
+          stream.write(frameConnectMessage(toolPause(toolCallId)));
+          if (scenario === "tool-pause-transport-death") {
+            const session = stream.session;
+            setTimeout(() => session.destroy(), 10);
+          }
+          return;
+        }
+        if (!paused || stream.closed || stream.destroyed) return;
+        paused = false;
+        const receivedExpectedResult = Buffer.from(chunk).includes(
+          Buffer.from(`result-for-${toolCallId}`),
+        );
+        stream.end(Buffer.concat([
+          frameConnectMessage(textDelta(receivedExpectedResult ? "resumed-correctly" : "resumed-with-wrong-result")),
+          frameConnectEndStream(new TextEncoder().encode("{}")),
+        ]));
+      });
+      return;
+    }
 
     const endWith = (body: Uint8Array) => stream.end(frameConnectEndStream(body));
     const trickle = (payload: Buffer) => {

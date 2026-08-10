@@ -616,6 +616,151 @@ async function testStreamingTerminationKnownFailures() {
   console.log("[test] Slow semantic progress survives bounded streaming completion");
 }
 
+async function runScenarioSubprocess(
+  apiUrl: string,
+  script: string,
+): Promise<Record<string, unknown>> {
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", script],
+    cwd: process.cwd(),
+    env: { ...process.env, CURSOR_API_URL: apiUrl },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  assertEqual(exitCode, 0, `Scenario subprocess failed: ${stderr}`);
+  return JSON.parse(stdout.trim()) as Record<string, unknown>;
+}
+
+async function observeToolResume(
+  apiUrl: string,
+  scenario: "tool-pause-resume" | "tool-pause-transport-death",
+  collision = false,
+): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess(apiUrl, `
+    import { startProxy, stopProxy } from "./src/proxy.ts";
+    const port = await startProxy(async () => "test-token");
+    const base = "http://localhost:" + port + "/v1/chat/completions";
+    const opening = "resume fixture collision-safe opening";
+    const request = (messages) => fetch(base, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", stream: true, messages, tools: [{ type: "function", function: { name: "fixture-tool", parameters: { type: "object" } } }] }),
+    });
+    const boundedText = async (response, deadlineMs = 150) => {
+      const reader = response.body.getReader(); let text = "";
+      const drain = (async () => { while (true) { const { done, value } = await reader.read(); if (done) return { text, timedOut: false }; text += new TextDecoder().decode(value, { stream: true }); } })();
+      const result = await Promise.race([drain, new Promise(resolve => setTimeout(() => resolve({ text, timedOut: true }), deadlineMs))]);
+      void reader.cancel().catch(() => {}); return result;
+    };
+    const first = await boundedText(await request([{ role: "user", content: opening }]));
+    const firstCall = JSON.parse(first.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
+    if ("${scenario}" === "tool-pause-transport-death") await Bun.sleep(30);
+    let second; let secondCall;
+    if (${collision}) {
+      second = await boundedText(await request([{ role: "user", content: opening }]));
+      secondCall = JSON.parse(second.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
+    }
+    const resumed = await boundedText(await request([
+      { role: "user", content: opening },
+      { role: "assistant", content: null, tool_calls: [{ id: firstCall, type: "function", function: { name: "fixture-tool", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: firstCall, content: "result-for-" + firstCall },
+    ]));
+    stopProxy();
+    console.log(JSON.stringify({ first, second, secondCall, resumed }));
+    process.exit(0);
+  `);
+}
+
+async function observeStalledRefresh(): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess("http://127.0.0.1:1", `
+    import http from "node:http";
+    const server = http.createServer((_, res) => { void res; });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    process.env.CURSOR_REFRESH_URL = "http://127.0.0.1:" + port + "/auth/exchange_user_api_key";
+    const { refreshCursorToken } = await import("./src/auth.ts");
+    const { startProxy, stopProxy } = await import("./src/proxy.ts");
+    const proxyPort = await startProxy(async () => (await refreshCursorToken("stalled-refresh")).access);
+    const pending = fetch("http://localhost:" + proxyPort + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "refresh stall" }] }) });
+    const result = await Promise.race([pending.then(() => ({ headersReturned: true })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
+    stopProxy(); server.close(); console.log(JSON.stringify(result)); process.exit(0);
+  `);
+}
+
+async function observeNonStreamingStall(apiUrl: string): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess(apiUrl, `
+    import { startProxy, stopProxy } from "./src/proxy.ts";
+    const port = await startProxy(async () => "test-token");
+    const pending = fetch("http://localhost:" + port + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "non-streaming stall" }] }) });
+    const result = await Promise.race([pending.then(() => ({ headersReturned: true })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
+    stopProxy(); console.log(JSON.stringify(result)); process.exit(0);
+  `);
+}
+
+async function testResumeRefreshAndNonStreamingKnownFailures() {
+  console.log("[test] Reproducing quarantined resume, refresh, and collection failures...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    fixture.setScenario("tool-pause-resume");
+    const liveResume = await observeToolResume(fixture.apiUrl, "tool-pause-resume");
+    assert(
+      String((liveResume.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "Healthy tool resume must preserve the matching tool result",
+    );
+    console.log("[test] Healthy tool resume preserves the paused bridge and result");
+
+    fixture.setScenario("tool-pause-transport-death");
+    const deadResume = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    assert(
+      String((deadResume.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
+      "A dead bridge must fall back to a new request instead of resuming the old stream",
+    );
+    console.log("[test] Transport death exits the child; resume follows the fresh-request fallback");
+
+    fixture.setScenario("tool-pause-resume");
+    const collision = await observeToolResume(fixture.apiUrl, "tool-pause-resume", true);
+    await expectKnownFailure(
+      "same-opening conversations retain isolated paused bridges",
+      async () => assert(String((collision.resumed as { text?: string }).text ?? "").includes("resumed-correctly"), "A resume must reach its own paused bridge"),
+      () => `observed secondCall=${String(collision.secondCall)}, body=${JSON.stringify((collision.resumed as { text?: string }).text ?? "")}`,
+    );
+
+    fixture.setScenario("tool-pause-transport-death");
+    const droppedWrite = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    assert(
+      String((droppedWrite.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
+      "A closed transport must not accept a dropped resume write as a live bridge",
+    );
+    console.log("[test] Closed-stream fixture does not reproduce a silent dropped write; child exit triggers fallback");
+  } finally {
+    await fixture.close();
+  }
+
+  const refresh = await observeStalledRefresh();
+  await expectKnownFailure(
+    "stalled token refresh returns headers or an error",
+    async () => assert(refresh.headersReturned === true, "Refresh stall must not leave the request pre-header"),
+    () => `observed headersReturned=${String(refresh.headersReturned)}`,
+  );
+
+  const collectionFixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    collectionFixture.setScenario("heartbeat-trickle-kept-open");
+    const nonStreaming = await observeNonStreamingStall(collectionFixture.apiUrl);
+    await expectKnownFailure(
+      "non-streaming collection reaches a bounded terminal response",
+      async () => assert(nonStreaming.headersReturned === true, "Non-streaming collection must not wait forever for bridge close"),
+      () => `observed headersReturned=${String(nonStreaming.headersReturned)}`,
+    );
+  } finally {
+    await collectionFixture.close();
+  }
+}
+
 async function testLifecycleDiagnostics(modules: TestModules) {
   console.log("[test] Testing redacted lifecycle diagnostics...");
   const originalSetting = process.env.CURSOR_PROXY_DIAGNOSTICS;
@@ -813,6 +958,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testFakeCursorScenarioHarness();
     await testStreamingTerminationKnownFailures();
+    await testResumeRefreshAndNonStreamingKnownFailures();
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
