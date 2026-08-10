@@ -1128,13 +1128,13 @@ export interface StreamState {
 }
 
 // The initial wait is deliberately longer: reasoning models may queue and
-// plan for minutes before emitting their first token. Afterwards, five
+// plan for minutes before emitting their first token. Afterwards, ten
 // minutes still accommodates extended thinking while bounding heartbeat-only
 // stalls. Hard caps keep invalid environment values from disabling this guard.
-const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS = 5 * 60 * 1000;
-const MAX_FIRST_PROGRESS_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_SEMANTIC_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_FIRST_PROGRESS_TIMEOUT_MS = 60 * 60 * 1000;
+const MAX_SEMANTIC_PROGRESS_TIMEOUT_MS = 30 * 60 * 1000;
 
 function boundedDuration(name: string, fallback: number, maximum: number): number {
   const value = Number.parseInt(process.env[name] ?? "", 10);
