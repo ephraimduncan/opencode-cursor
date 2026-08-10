@@ -21,6 +21,7 @@ export type CursorScenario =
   | "empty-end-stream"
   | "missing-end-stream"
   | "malformed-terminal"
+  | "malformed-server-message"
   | "partial-frame"
   | "slow-semantic-progress"
   | "heartbeat-trickle"
@@ -41,6 +42,7 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "empty-end-stream",
   "missing-end-stream",
   "malformed-terminal",
+  "malformed-server-message",
   "partial-frame",
   "slow-semantic-progress",
   "heartbeat-trickle",
@@ -273,6 +275,12 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
         break;
       case "malformed-terminal":
         stream.end(frameMalformedConnectMessage(new TextEncoder().encode("{"), 9));
+        break;
+      case "malformed-server-message":
+        stream.end(Buffer.concat([
+          frameConnectMessage(new Uint8Array([0xff])),
+          frameConnectEndStream(new TextEncoder().encode("{}")),
+        ]));
         break;
       case "partial-frame":
         stream.end(frameConnectMessage(textDelta("partial")).subarray(0, 7));

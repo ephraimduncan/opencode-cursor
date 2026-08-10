@@ -1,6 +1,6 @@
 # Cursor Model Hang — Root Cause Analysis
 
-Status: **Evidence baseline established; lifecycle and termination map complete.** This
+Status: **Evidence baseline, lifecycle map, and terminal-contract runtime evidence complete.** This
 document opens the hang investigation: it preserves the speculative uncommitted overlay that
 predated this investigation, classifies every hunk with an explicit disposition, records
 baseline-vs-overlay behavior, and then (Part 2) enumerates every open-SSE path and termination
@@ -451,3 +451,31 @@ ordinary passing assertions.
 The bounded suite remains safe: subprocesses exit after recording each 125ms observation, and
 the fake server closes every tracked session and stream. No production source seam was added for
 these reproductions.
+
+## 2.12 Terminal-contract evidence and remaining mechanism verdicts
+
+The streaming boundary now has one idempotent terminal owner. It flushes buffered output, emits
+the error (when any), `stop`, usage, and one `[DONE]`, then releases the heartbeat, bridge-map
+entry, child stdin, and SSE controller. A client cancellation takes the same resource-release
+path without attempting a second SSE sequence. A tool-call pause is intentionally different: it
+closes the current SSE response after `tool_calls`, but retains the live bridge and heartbeat for
+the follow-up tool result. If that retained bridge later exits, its map entry is removed rather
+than being treated as resumable.
+
+Complete Connect frames that fail protobuf decoding are now terminal protocol errors. This does
+not make ordinary forward-compatible traffic fatal: protobuf preserves unknown fields, and known
+but unsupported message families are explicitly classified. A decode exception means the payload
+is structurally invalid, so continuing could silently discard the only terminal signal. Likewise,
+a rejected parent-to-bridge write throws into the terminal owner; a write attempted after the
+bridge H2 stream is closed makes the child exit non-zero rather than being silently discarded.
+
+| Originally theorized mechanism | Runtime verdict | Evidence and present disposition |
+|---|---|---|
+| Empty Connect end-stream is an error | **Refuted after fix** | The zero-byte fixture completes cleanly with exactly one `[DONE]`. |
+| Missing end-stream / abrupt H2 close becomes clean success or retry fodder | **Confirmed before fix; closed** | Missing-end, stream-reset, and abrupt-session-close fixtures now emit one explicit error and one `[DONE]`; no empty success is observed. This closes the local boundary implicated by issue #33. |
+| Malformed Connect terminal or protobuf message is silently lost | **Confirmed before fix; closed** | Partial/malformed terminal and malformed protobuf fixtures each reach one explicit error terminal. |
+| Bridge write failure is silently dropped | **Confirmed by source; propagation covered** | A rejected KV response write propagates out of dispatch into the terminal path; the bridge also exits non-zero when stdin reaches a closed H2 stream. The process-alive, transport-dead resume race remains deferred to the resume-liveness work. |
+| Tool-result pause must retain a live bridge | **Confirmed and preserved** | The healthy tool-resume fixture still returns `resumed-correctly`; pause is not terminal cleanup. |
+| Heartbeat/checkpoint traffic can stand in for semantic progress | **Confirmed before classification; not a terminal-contract result** | Fixtures classify heartbeat/turn-ended traffic as non-progress and report transport closure explicitly. Stall detection itself remains separate work. |
+| Unbounded refresh and non-streaming collection | **Confirmed and deferred** | Their quarantined bounded observations still show no headers at 125ms; no timeout, watchdog, or deadline was added here. |
+| Bridge-key collision | **Confirmed and deferred** | The quarantined same-opening-conversation assertion still reproduces cross-routing; key derivation was not changed. |

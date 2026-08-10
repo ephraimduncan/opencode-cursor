@@ -121,16 +121,21 @@ function resetTimeout() {
 }
 
 function killBridge(reason = "connect") {
+  failBridge(`Timeout:${reason}`);
+}
+
+let failed = false;
+function failBridge(errorName) {
+  if (failed) return;
+  failed = true;
   clearTimeout(timeout);
-  emitDiagnostic("terminal", { errorName: `Timeout:${reason}`, exitCode: 1 });
+  emitDiagnostic("terminal", { errorName, exitCode: 1 });
   try { client.destroy(); } catch {}
   process.exit(1);
 }
 
 client.on("error", (err) => {
-  clearTimeout(timeout);
-  emitDiagnostic("terminal", { errorName: err?.name || "Error", exitCode: 1 });
-  process.exit(1);
+  failBridge(err?.name || "Error");
 });
 
 const headers = {
@@ -177,9 +182,7 @@ h2Stream.on("data", (chunk) => {
 h2Stream.on("end", () => {
   clearTimeout(timeout);
   if (!unary && !sawConnectEndStream) {
-    emitDiagnostic("terminal", { errorName: "ConnectProtocolError", exitCode: 1 });
-    try { client.close(); } catch {}
-    process.exit(1);
+    failBridge("ConnectProtocolError");
   }
   emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
@@ -188,10 +191,7 @@ h2Stream.on("end", () => {
 });
 
 h2Stream.on("error", (err) => {
-  clearTimeout(timeout);
-  emitDiagnostic("terminal", { errorName: err?.name || "Error", exitCode: 1 });
-  try { client.close(); } catch {}
-  process.exit(1);
+  failBridge(err?.name || "Error");
 });
 
 // Forward stdin → H2 stream (after config message)
@@ -212,9 +212,16 @@ if (unary) {
         // EOF or zero-length = done writing
         break;
       }
-      if (!h2Stream.closed && !h2Stream.destroyed) {
+      if (h2Stream.closed || h2Stream.destroyed) {
+        failBridge("BridgeWriteError");
+        return;
+      }
+      try {
         resetTimeout();
         h2Stream.write(msg);
+      } catch (error) {
+        failBridge(error?.name || "BridgeWriteError");
+        return;
       }
     }
 

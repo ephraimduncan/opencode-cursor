@@ -6,10 +6,12 @@ import {
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ExecServerControlMessageSchema,
+  GetBlobArgsSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionQuerySchema,
   InteractionUpdateSchema,
+  KvServerMessageSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
   TurnEndedUpdateSchema,
@@ -605,6 +607,16 @@ async function testStreamingTerminationKnownFailures() {
   assertEqual(doneCount(malformedTerminal.body), 1, "Malformed terminal frame must emit exactly one [DONE]");
   console.log("[test] Malformed terminal frame is an explicit error exactly once");
 
+  const malformedMessage = await observeProxyScenario("malformed-server-message");
+  assert(malformedMessage.body.includes("Failed to process Cursor server message"), "Malformed protobuf payloads must reach the terminal error owner");
+  assertEqual(doneCount(malformedMessage.body), 1, "Malformed protobuf payloads must emit exactly one [DONE]");
+  console.log("[test] Malformed protobuf payloads terminate explicitly exactly once");
+
+  const abruptClose = await observeProxyScenario("abrupt-session-close");
+  assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
+  assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
+  console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+
   const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open");
   assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal after transport closure");
   assertEqual(doneCount(heartbeatTrickle.body), 1, "Heartbeat-only transport closure must emit exactly one [DONE]");
@@ -635,10 +647,14 @@ async function testServerMessageClassification(modules: TestModules) {
     semanticProgressCount: 0,
     lastSemanticProgressAt: 0,
   };
-  const dispatch = (message: Parameters<typeof create>[1], onProtocolError?: (error: Error) => void) =>
+  const dispatch = (
+    message: Parameters<typeof create>[1],
+    onProtocolError?: (error: Error) => void,
+    sendFrame: (data: Uint8Array) => void = () => {},
+  ) =>
     modules.processServerMessage(
       create(AgentServerMessageSchema, message as never),
-      new Map(), [], undefined, () => {}, state, () => {}, () => {}, undefined, onProtocolError,
+      new Map(), [], undefined, sendFrame, state, () => {}, () => {}, undefined, onProtocolError,
     );
 
   dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
@@ -666,6 +682,17 @@ async function testServerMessageClassification(modules: TestModules) {
     message: { case: "abort", value: { id: 1 } },
   }) } }, (error) => { unsupportedError = error; });
   assert(unsupportedError?.message.includes("Unsupported Cursor exec control message"), "Unsupported control messages must trigger an explicit terminal error");
+
+  let writeFailure: Error | undefined;
+  try {
+    dispatch({ message: { case: "kvServerMessage", value: create(KvServerMessageSchema, {
+      id: 1,
+      message: { case: "getBlobArgs", value: create(GetBlobArgsSchema, { blobId: new Uint8Array([1]) }) },
+    }) } }, undefined, () => { throw new Error("bridge write rejected"); });
+  } catch (error) {
+    writeFailure = error instanceof Error ? error : new Error(String(error));
+  }
+  assertEqual(writeFailure?.message, "bridge write rejected", "Bridge write failures must propagate to the terminal owner");
   console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
 }
 

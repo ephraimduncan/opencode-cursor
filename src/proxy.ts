@@ -306,8 +306,11 @@ interface SpawnBridgeOptions {
 
 function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
-  write: (data: Uint8Array) => void;
+  /** Returns false when the child has already exited or its stdin rejects the frame. */
+  write: (data: Uint8Array) => boolean;
   end: () => void;
+  /** Stop the child when this request has reached a non-resumable terminal state. */
+  terminate: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
@@ -410,13 +413,23 @@ function spawnBridge(options: SpawnBridgeOptions): {
     proc,
     get alive() { return !exited; },
     write(data) {
-      try { proc.stdin.write(lpEncode(data)); } catch {}
+      if (exited) return false;
+      try {
+        proc.stdin.write(lpEncode(data));
+        return true;
+      } catch {
+        return false;
+      }
     },
     end() {
       try {
         proc.stdin.write(lpEncode(new Uint8Array(0)));
         proc.stdin.end();
       } catch {}
+    },
+    terminate() {
+      try { proc.stdin.end(); } catch {}
+      try { proc.kill(); } catch {}
     },
     onData(cb) { cbs.data = cb; },
     onClose(cb) {
@@ -1540,6 +1553,7 @@ function createBridgeStreamResponse(
         if (terminal) return;
         terminal = true;
         clearInterval(heartbeatTimer);
+        activeBridges.delete(bridgeKey);
 
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1549,7 +1563,7 @@ function createBridgeStreamResponse(
         sendSSE(makeUsageChunk());
         sendDone();
         closeController();
-        activeBridges.delete(bridgeKey);
+        bridge.terminate();
       };
 
       cancelStream = () => {
@@ -1557,7 +1571,7 @@ function createBridgeStreamResponse(
         terminal = true;
         clearInterval(heartbeatTimer);
         activeBridges.delete(bridgeKey);
-        bridge.end();
+        bridge.terminate();
       };
 
       const processChunk = createConnectFrameParser(
@@ -1573,7 +1587,9 @@ function createBridgeStreamResponse(
               blobStore,
               mcpTools,
               cloudRule,
-              (data) => bridge.write(data),
+              (data) => {
+                if (!bridge.write(data)) throw new Error("Failed to write frame to Cursor bridge");
+              },
               state,
               (text, isThinking) => {
                 if (isThinking) {
@@ -1632,10 +1648,7 @@ function createBridgeStreamResponse(
                   persistConversation(convKey, stored);
                 }
               },
-              (error) => {
-                finishTerminal(error);
-                bridge.end();
-              },
+              finishTerminal,
             );
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
               messageCase: serverMessage.message.case,
@@ -1643,8 +1656,14 @@ function createBridgeStreamResponse(
                 ? serverMessage.message.value.message?.case
                 : undefined,
             });
-          } catch {
-            // Skip unparseable messages
+          } catch (error) {
+            // A complete Connect message frame that cannot decode as an
+            // AgentServerMessage cannot be safely skipped: it may be the only
+            // terminal signal. Unknown fields remain protobuf-compatible; this
+            // path is reserved for structurally invalid payloads and writes.
+            finishTerminal(error instanceof Error
+              ? new Error(`Failed to process Cursor server message: ${error.message}`)
+              : new Error("Failed to process Cursor server message"));
           }
         },
         (endStreamBytes) => {
@@ -1658,7 +1677,6 @@ function createBridgeStreamResponse(
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }
           finishTerminal(endError ?? undefined);
-          bridge.end();
         },
       );
 
@@ -1675,7 +1693,10 @@ function createBridgeStreamResponse(
         }
         if (terminal) return;
         if (mcpExecReceived) {
-          if (code !== 0) activeBridges.delete(bridgeKey);
+          // Tool pause deliberately owns neither terminal cleanup nor bridge
+          // shutdown. Once the retained bridge itself exits, it is stale on
+          // either exit code and must no longer be resumable.
+          activeBridges.delete(bridgeKey);
           return;
         }
 
