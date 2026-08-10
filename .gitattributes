@@ -1,0 +1,5 @@
+# docs/overlay-baseline.patch is a verbatim preserved evidence artifact: a unified diff
+# represents a blank source line as a context line containing a single space, which
+# `git diff --check` flags as trailing whitespace. This is intentional — never strip or
+# reflow the file, or git apply fidelity is lost.
+docs/overlay-baseline.patch -whitespace

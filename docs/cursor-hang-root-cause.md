@@ -33,6 +33,12 @@ The complete, verbatim pre-disposition diff is preserved in
 [`docs/overlay-baseline.patch`](./overlay-baseline.patch). Every line removed below remains
 recoverable and reviewable from that artifact. Nothing was silently discarded.
 
+> **Whitespace exemption (read before "tidying"):** `docs/overlay-baseline.patch` is excluded
+> from git's whitespace checks via `.gitattributes` (`-whitespace`). A unified diff encodes a
+> blank source line as a context line containing a single space, so `git diff --check` flags
+> the file by design. Never reflow, reformat, or strip trailing whitespace from this artifact —
+> doing so corrupts the evidence and breaks `git apply` fidelity.
+
 ## Hunk inventory and disposition
 
 | # | File | Location | Change | Apparent intent | Hang mechanism affected | Verdict |
