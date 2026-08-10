@@ -557,7 +557,9 @@ export async function startProxy(
             emitLifecycleDiagnostic("proxy", "auth_access_start");
             const accessToken = await proxyAccessTokenProvider();
             emitLifecycleDiagnostic("proxy", "auth_access_complete");
-            return handleChatCompletion(body, accessToken);
+            // Await so failures from either streaming or non-streaming handling
+            // remain inside this request's structured-error boundary.
+            return await handleChatCompletion(body, accessToken);
           } catch (err) {
             emitLifecycleDiagnostic("proxy", "terminal", {
               errorName: err instanceof Error ? err.name : "UnknownError",
@@ -1129,7 +1131,10 @@ export function processServerMessage(
       onProtocolError?.(new Error(`Unsupported Cursor interaction query: ${msg.message.value.query.case ?? "unknown"}`));
       return;
     case undefined:
-      onProtocolError?.(new Error("Cursor server message had no message case"));
+      // Protobuf decoders represent empty or forward-compatible messages as an
+      // unset oneof. They carry no semantic progress and must not turn a valid
+      // stream into a protocol error; structurally invalid payloads still throw
+      // during decoding and are terminated by the caller.
       return;
     default: {
       const unhandled: never = msg.message;
@@ -1923,8 +1928,16 @@ async function collectFullResponse(
             reject(error);
           },
         );
-      } catch {
-        // Skip
+      } catch (error) {
+        // A complete Connect frame with an invalid protobuf payload cannot be
+        // safely ignored in unary mode either: it may contain the only
+        // terminal signal. Preserve the same explicit protocol failure that
+        // the streaming path emits.
+        clearInterval(heartbeatTimer);
+        bridge.end();
+        reject(error instanceof Error
+          ? new Error(`Failed to process Cursor server message: ${error.message}`)
+          : new Error("Failed to process Cursor server message"));
       }
     },
     () => {},

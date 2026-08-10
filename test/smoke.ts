@@ -432,9 +432,39 @@ async function testArrayContentParsing(modules: TestModules) {
       );
     }
   }
+  assertEqual(res.status, 200, "Empty protobuf frames must be ignored without failing a non-streaming response");
 
   modules.stopProxy();
   console.log("[test] Array content parsing OK");
+}
+
+async function testNonStreamingProtocolErrorsAreStructured() {
+  console.log("[test] Testing non-streaming protocol error handling...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("malformed-server-message");
+  try {
+    const result = await runScenarioSubprocess(fixture.apiUrl, `
+      import { startProxy, stopProxy } from "./src/proxy.ts";
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "malformed non-streaming response" }] }),
+      });
+      const body = await response.json();
+      stopProxy();
+      console.log(JSON.stringify({ status: response.status, body }));
+      process.exit(0);
+    `);
+    assertEqual(result.status, 500, "Non-streaming protocol errors must return a structured server error");
+    const body = result.body as { error?: { message?: string } };
+    assert(
+      body.error?.message?.includes("Failed to process Cursor server message"),
+      "Non-streaming protocol errors must preserve the terminal error message",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Non-streaming protocol errors return structured responses");
 }
 
 async function runFakeScenario(apiUrl: string, scenario: CursorScenario): Promise<Buffer> {
@@ -1030,12 +1060,19 @@ async function main() {
 
   const modules = await loadModules();
 
+  let unhandledRejection: unknown;
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejection = reason;
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+
   try {
     await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
+    await testNonStreamingProtocolErrorsAreStructured();
     await testFakeCursorScenarioHarness();
     await testStreamingTerminationKnownFailures();
     await testServerMessageClassification(modules);
@@ -1043,12 +1080,15 @@ async function main() {
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await Bun.sleep(0);
+    assert(!unhandledRejection, `Unhandled rejection escaped the smoke harness: ${String(unhandledRejection)}`);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
     console.error("\n✗ Smoke test failed:", err);
     process.exitCode = 1;
   } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
     modules.stopProxy();
     await backend.close();
   }
