@@ -594,23 +594,8 @@ async function observeProxyScenario(
   }
 }
 
-async function expectKnownFailure(
-  label: string,
-  expectedBehavior: () => Promise<void>,
-  observed: () => string,
-) {
-  try {
-    await expectedBehavior();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.log(`[known-failure] ${label}: ${observed()} (${message})`);
-    return;
-  }
-  throw new Error(`Known failure unexpectedly passed: ${label}; remove its quarantine and make it required`);
-}
-
-async function testStreamingTerminationKnownFailures() {
-  console.log("[test] Reproducing quarantined streaming termination failures...");
+async function testStreamingTermination() {
+  console.log("[test] Testing streaming termination behavior...");
 
   const cleanEnd = await observeProxyScenario("clean-end-stream-kept-open");
   assert(!cleanEnd.timedOut && cleanEnd.body.includes("data: [DONE]"), "Clean end-stream must finish in the local H2 fixture");
@@ -676,10 +661,24 @@ async function testStreamingTerminationKnownFailures() {
   assertEqual(doneCount(sessionTimeout.body), 1, "HTTP/2 session timeout must emit exactly one [DONE]");
   console.log("[test] HTTP/2 session timeout is explicit exactly once");
 
-  const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open");
-  assert(heartbeatTrickle.body.includes("[Error:"), "Heartbeat-only traffic must reach an explicit error terminal after transport closure");
-  assertEqual(doneCount(heartbeatTrickle.body), 1, "Heartbeat-only transport closure must emit exactly one [DONE]");
-  console.log("[test] Heartbeat-only transport closure is an explicit error exactly once");
+  const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+  });
+  assert(!heartbeatTrickle.timedOut, "Heartbeat-only traffic must be bounded by semantic progress, not fixture closure");
+  assert(heartbeatTrickle.body.includes("[Error: Cursor response stalled waiting for first progress]"), "Heartbeat-only traffic must reach an explicit semantic-stall error");
+  assertEqual(doneCount(heartbeatTrickle.body), 1, "Heartbeat-only semantic stalls must emit exactly one [DONE]");
+  console.log("[test] Heartbeat-only traffic is bounded by semantic progress exactly once");
+
+  const firstProgressStall = await observeProxyScenario("silent-transport", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!firstProgressStall.timedOut, "First-progress stalls must be bounded before transport liveness expires");
+  assert(firstProgressStall.body.includes("[Error: Cursor response stalled waiting for first progress]"), "First-progress stalls must surface an explicit error");
+  assertEqual(doneCount(firstProgressStall.body), 1, "First-progress stalls must emit exactly one [DONE]");
+  console.log("[test] First-progress stalls are bounded independently of transport liveness");
 
   const turnEnded = await observeProxyScenario("turn-ended-kept-open");
   assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
@@ -869,18 +868,8 @@ async function observeSuccessfulRefresh(): Promise<Record<string, unknown>> {
   `);
 }
 
-async function observeNonStreamingStall(apiUrl: string): Promise<Record<string, unknown>> {
-  return runScenarioSubprocess(apiUrl, `
-    import { startProxy, stopProxy } from "./src/proxy.ts";
-    const port = await startProxy(async () => "test-token");
-    const pending = fetch("http://localhost:" + port + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "non-streaming stall" }] }) });
-    const result = await Promise.race([pending.then(() => ({ headersReturned: true })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
-    stopProxy(); console.log(JSON.stringify(result)); process.exit(0);
-  `);
-}
-
-async function testResumeRefreshAndNonStreamingKnownFailures(modules: TestModules) {
-  console.log("[test] Reproducing quarantined resume, refresh, and collection failures...");
+async function testResumeRefreshAndNonStreaming(modules: TestModules) {
+  console.log("[test] Testing resume, refresh, and collection behavior...");
   const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   try {
     fixture.setScenario("tool-pause-resume");
@@ -964,12 +953,20 @@ async function testResumeRefreshAndNonStreamingKnownFailures(modules: TestModule
   const collectionFixture = await createFakeCursorServer({ deadlineMs: 1_000 });
   try {
     collectionFixture.setScenario("heartbeat-trickle-kept-open");
-    const nonStreaming = await observeNonStreamingStall(collectionFixture.apiUrl);
-    await expectKnownFailure(
-      "non-streaming collection reaches a bounded terminal response",
-      async () => assert(nonStreaming.headersReturned === true, "Non-streaming collection must not wait forever for bridge close"),
-      () => `observed headersReturned=${String(nonStreaming.headersReturned)}`,
-    );
+    const nonStreaming = await runScenarioSubprocess(collectionFixture.apiUrl, `
+      process.env.CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS = "25";
+      process.env.CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS = "25";
+      const { startProxy, stopProxy } = await import("./src/proxy.ts");
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "non-streaming stall" }] }) });
+      const body = await response.json(); stopProxy(); console.log(JSON.stringify({ headersReturned: true, status: response.status, body })); process.exit(0);
+    `);
+    assert(nonStreaming.headersReturned === true, "Non-streaming collection must not wait forever for bridge close");
+    assertEqual(nonStreaming.status, 504, "Non-streaming semantic stalls must return Gateway Timeout");
+    const nonStreamingError = nonStreaming.body as { error?: { type?: string; code?: string } };
+    assertEqual(nonStreamingError.error?.type, "gateway_timeout", "Non-streaming stalls must be structured timeout errors");
+    assertEqual(nonStreamingError.error?.code, "response_stall_timeout", "Non-streaming stalls must identify the response boundary");
+    console.log("[test] Non-streaming collection returns a bounded structured stall error");
   } finally {
     await collectionFixture.close();
   }
@@ -1178,9 +1175,9 @@ async function main() {
     await testArrayContentParsing(modules);
     await testNonStreamingProtocolErrorsAreStructured();
     await testFakeCursorScenarioHarness();
-    await testStreamingTerminationKnownFailures();
+    await testStreamingTermination();
     await testServerMessageClassification(modules);
-    await testResumeRefreshAndNonStreamingKnownFailures(modules);
+    await testResumeRefreshAndNonStreaming(modules);
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

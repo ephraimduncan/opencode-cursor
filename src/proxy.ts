@@ -602,16 +602,17 @@ export async function startProxy(
             });
             const message = err instanceof Error ? err.message : String(err);
             const refreshTimedOut = err instanceof CursorTokenRefreshTimeoutError;
+            const responseStalled = err instanceof CursorResponseStallTimeoutError;
             return new Response(
               JSON.stringify({
                 error: {
                   message,
-                  type: refreshTimedOut ? "gateway_timeout" : "server_error",
-                  code: refreshTimedOut ? "token_refresh_timeout" : "internal_error",
+                  type: refreshTimedOut || responseStalled ? "gateway_timeout" : "server_error",
+                  code: refreshTimedOut ? "token_refresh_timeout" : responseStalled ? "response_stall_timeout" : "internal_error",
                 },
               }),
               {
-                status: refreshTimedOut ? 504 : 500,
+                status: refreshTimedOut || responseStalled ? 504 : 500,
                 headers: { "Content-Type": "application/json" },
               },
             );
@@ -1126,6 +1127,63 @@ export interface StreamState {
   lastSemanticProgressAt: number;
 }
 
+// The initial wait is deliberately longer: reasoning models may queue and
+// plan for minutes before emitting their first token. Afterwards, five
+// minutes still accommodates extended thinking while bounding heartbeat-only
+// stalls. Hard caps keep invalid environment values from disabling this guard.
+const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_FIRST_PROGRESS_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_SEMANTIC_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000;
+
+function boundedDuration(name: string, fallback: number, maximum: number): number {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? Math.min(value, maximum) : fallback;
+}
+
+class CursorResponseStallTimeoutError extends Error {
+  constructor(stage: "first_progress" | "semantic_progress") {
+    super(`Cursor response stalled waiting for ${stage.replace("_", " ")}`);
+    this.name = "CursorResponseStallTimeoutError";
+  }
+}
+
+function createSemanticProgressWatchdog(
+  state: StreamState,
+  onStall: (error: CursorResponseStallTimeoutError) => void,
+): { observe: () => void; clear: () => void } {
+  const firstProgressTimeoutMs = boundedDuration(
+    "CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS",
+    DEFAULT_FIRST_PROGRESS_TIMEOUT_MS,
+    MAX_FIRST_PROGRESS_TIMEOUT_MS,
+  );
+  const semanticProgressTimeoutMs = boundedDuration(
+    "CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS",
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS,
+    MAX_SEMANTIC_PROGRESS_TIMEOUT_MS,
+  );
+  let observedProgress = state.semanticProgressCount;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const arm = (timeoutMs: number, stage: "first_progress" | "semantic_progress") => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => onStall(new CursorResponseStallTimeoutError(stage)), timeoutMs);
+  };
+
+  arm(firstProgressTimeoutMs, "first_progress");
+  return {
+    observe() {
+      if (state.semanticProgressCount === observedProgress) return;
+      observedProgress = state.semanticProgressCount;
+      arm(semanticProgressTimeoutMs, "semantic_progress");
+    },
+    clear() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
 function computeUsage(state: StreamState) {
   const completion_tokens = state.outputTokens;
   const total_tokens = state.totalTokens || completion_tokens;
@@ -1608,10 +1666,12 @@ function createBridgeStreamResponse(
       let mcpExecReceived = false;
       let connectEndStreamReceived = false;
       let terminal = false;
+      let semanticWatchdog: ReturnType<typeof createSemanticProgressWatchdog>;
 
       const finishTerminal = (error?: Error) => {
         if (terminal) return;
         terminal = true;
+        semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
         for (const active of activeBridges.values()) {
           if (active.bridge === bridge) removeActiveBridge(active);
@@ -1631,6 +1691,7 @@ function createBridgeStreamResponse(
       cancelStream = () => {
         if (terminal) return;
         terminal = true;
+        semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
         for (const active of activeBridges.values()) {
           if (active.bridge === bridge) removeActiveBridge(active);
@@ -1666,6 +1727,9 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                // A tool pause transfers control to the caller; it is not a
+                // model-output stall and must leave its live bridge resumable.
+                semanticWatchdog.clear();
                 emitLifecycleDiagnostic("proxy", "tool_pause");
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
@@ -1726,6 +1790,7 @@ function createBridgeStreamResponse(
               },
               finishTerminal,
             );
+            semanticWatchdog.observe();
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
               messageCase: serverMessage.message.case,
               interactionCase: serverMessage.message.case === "interactionUpdate"
@@ -1756,10 +1821,13 @@ function createBridgeStreamResponse(
         },
       );
 
+      semanticWatchdog = createSemanticProgressWatchdog(state, finishTerminal);
+
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
         emitLifecycleDiagnostic("proxy", "terminal", { exitCode: code });
+        semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1957,6 +2025,7 @@ async function collectFullResponse(
 ): Promise<CollectedResponse> {
   const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
+  let settled = false;
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
@@ -1970,6 +2039,32 @@ async function collectFullResponse(
   };
   const tagFilter = createThinkingTagFilter();
 
+  const persistState = () => {
+    const stored = conversationStates.get(convKey);
+    if (stored) {
+      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+      persistConversation(convKey, stored);
+    }
+  };
+  let semanticWatchdog: ReturnType<typeof createSemanticProgressWatchdog>;
+  const finishCollection = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    semanticWatchdog.clear();
+    clearInterval(heartbeatTimer);
+    persistState();
+    if (error) {
+      bridge.terminate();
+      reject(error);
+      return;
+    }
+    const flushed = tagFilter.flush();
+    fullText += flushed.content;
+    bridge.terminate();
+    resolve({ text: fullText, usage: computeUsage(state) });
+  };
+
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
       try {
@@ -1982,7 +2077,9 @@ async function collectFullResponse(
           payload.blobStore,
           payload.mcpTools,
           payload.cloudRule,
-          (data) => bridge.write(data),
+          (data) => {
+            if (!bridge.write(data)) throw new Error("Failed to write frame to Cursor bridge");
+          },
           state,
           (text, isThinking) => {
             if (isThinking) return;
@@ -2000,42 +2097,34 @@ async function collectFullResponse(
             }
           },
           (error) => {
-            clearInterval(heartbeatTimer);
-            bridge.end();
-            reject(error);
+            finishCollection(error);
           },
         );
+        semanticWatchdog.observe();
       } catch (error) {
         // A complete Connect frame with an invalid protobuf payload cannot be
         // safely ignored in unary mode either: it may contain the only
         // terminal signal. Preserve the same explicit protocol failure that
         // the streaming path emits.
-        clearInterval(heartbeatTimer);
-        bridge.end();
-        reject(error instanceof Error
+        finishCollection(error instanceof Error
           ? new Error(`Failed to process Cursor server message: ${error.message}`)
           : new Error("Failed to process Cursor server message"));
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      const endError = parseConnectEndStream(endStreamBytes);
+      finishCollection(endError ?? undefined);
+    },
   ));
 
-  bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      persistConversation(convKey, stored);
-    }
-    const flushed = tagFilter.flush();
-    fullText += flushed.content;
+  semanticWatchdog = createSemanticProgressWatchdog(state, finishCollection);
 
-    const usage = computeUsage(state);
-    resolve({
-      text: fullText,
-      usage,
-    });
+  bridge.onClose((code) => {
+    finishCollection(new Error(
+      code === 0
+        ? "Connect stream ended without end-of-stream frame"
+        : `Bridge exited with code ${code} before Connect end-stream`,
+    ));
   });
 
   return promise;
