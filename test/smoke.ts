@@ -693,6 +693,27 @@ async function testStreamingTermination() {
   }
   assert(slowProgress.body.includes("data: [DONE]"), "Slow semantic progress must finish normally");
   console.log("[test] Slow semantic progress survives bounded streaming completion");
+
+  const semanticStall = await observeProxyScenario("semantic-progress-stall", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!semanticStall.timedOut, "Post-progress stalls must be bounded before the observation deadline");
+  assert(semanticStall.body.includes("[Error: Cursor response stalled waiting for semantic progress]"), "Post-progress stalls must use the between-progress bound, not the first-progress bound");
+  assertEqual(doneCount(semanticStall.body), 1, "Post-progress semantic stalls must emit exactly one [DONE]");
+  console.log("[test] Post-progress silence uses the semantic-progress stall bound");
+
+  const semanticTrickle = await observeProxyScenario("semantic-progress-trickle", 500, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+  });
+  assert(!semanticTrickle.timedOut, "Slow semantic progress must survive each re-armed between-progress bound");
+  assert(!semanticTrickle.body.includes("[Error:"), "Re-armed semantic progress must not emit a stall error");
+  assert(semanticTrickle.body.includes("trickle-4"), "Re-armed semantic progress must preserve the final delta");
+  assertEqual(doneCount(semanticTrickle.body), 1, "Re-armed semantic progress must emit exactly one [DONE]");
+  console.log("[test] Repeated semantic progress re-arms the between-progress bound");
 }
 
 async function testServerMessageClassification(modules: TestModules) {

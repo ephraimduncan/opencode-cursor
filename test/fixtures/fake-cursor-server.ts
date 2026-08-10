@@ -24,6 +24,8 @@ export type CursorScenario =
   | "malformed-server-message"
   | "partial-frame"
   | "slow-semantic-progress"
+  | "semantic-progress-stall"
+  | "semantic-progress-trickle"
   | "heartbeat-trickle"
   | "heartbeat-trickle-kept-open"
   | "turn-ended-kept-open"
@@ -48,6 +50,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "malformed-server-message",
   "partial-frame",
   "slow-semantic-progress",
+  "semantic-progress-stall",
+  "semantic-progress-trickle",
   "heartbeat-trickle",
   "heartbeat-trickle-kept-open",
   "turn-ended-kept-open",
@@ -303,6 +307,25 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
             endWith(new TextEncoder().encode("{}"));
           }
         }, 15);
+        break;
+      }
+      case "semantic-progress-stall":
+        setTimeout(() => {
+          if (!stream.closed && !stream.destroyed) {
+            stream.write(frameConnectMessage(textDelta("before-semantic-stall")));
+          }
+        }, 10);
+        break;
+      case "semantic-progress-trickle": {
+        let part = 0;
+        const interval = setInterval(() => {
+          if (stream.closed || stream.destroyed) return clearInterval(interval);
+          if (part < 4) stream.write(frameConnectMessage(textDelta(`trickle-${++part}`)));
+          else {
+            clearInterval(interval);
+            endWith(new TextEncoder().encode("{}"));
+          }
+        }, 20);
         break;
       }
       case "heartbeat-trickle":
