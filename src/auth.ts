@@ -1,4 +1,5 @@
 import { generatePKCE } from "./pkce";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
@@ -10,6 +11,59 @@ const POLL_MAX_ATTEMPTS = 150;
 const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
+
+const lifecycleDiagnosticContext = new AsyncLocalStorage<{
+  requestId: string;
+  startedAt: number;
+  emittedStages: Set<LifecycleDiagnosticStage>;
+}>();
+
+export type LifecycleDiagnosticStage =
+  | "auth_access_start" | "auth_access_complete"
+  | "auth_refresh_start" | "auth_refresh_complete" | "auth_refresh_failed"
+  | "proxy_entry" | "bridge_spawn" | "connect_frame" | "message_dispatch"
+  | "tool_pause" | "tool_resume" | "sse_emission" | "terminal";
+
+type LifecycleDiagnosticDetails = Readonly<{
+  byteLength?: number; messageCase?: string; interactionCase?: string;
+  toolCount?: number; exitCode?: number; errorName?: string;
+}>;
+
+/** Diagnostics are opt-in because even safe metadata is operational noise. */
+export function lifecycleDiagnosticsEnabled(): boolean {
+  return process.env.CURSOR_PROXY_DIAGNOSTICS === "1";
+}
+
+/** Keep one correlation ID across asynchronous proxy and auth work. */
+export function withLifecycleDiagnosticContext<T>(requestId: string, operation: () => T): T {
+  return lifecycleDiagnosticContext.run({ requestId, startedAt: performance.now(), emittedStages: new Set() }, operation);
+}
+
+export function lifecycleDiagnosticContextInfo(): { requestId: string; elapsedMs: number } | undefined {
+  const context = lifecycleDiagnosticContext.getStore();
+  return context && { requestId: context.requestId, elapsedMs: Math.round(performance.now() - context.startedAt) };
+}
+
+/** Emits only explicitly allowlisted metadata. Do not add payload-bearing fields here. */
+export function emitLifecycleDiagnostic(
+  source: "auth" | "proxy", stage: LifecycleDiagnosticStage,
+  details: LifecycleDiagnosticDetails = {},
+): void {
+  if (!lifecycleDiagnosticsEnabled()) return;
+  const context = lifecycleDiagnosticContextInfo();
+  if (!context) return;
+  const store = lifecycleDiagnosticContext.getStore();
+  if (!store || store.emittedStages.has(stage)) return;
+  store.emittedStages.add(stage);
+  const event: Record<string, string | number> = { source, stage, requestId: context.requestId, elapsedMs: context.elapsedMs };
+  if (typeof details.byteLength === "number") event.byteLength = details.byteLength;
+  if (typeof details.messageCase === "string") event.messageCase = details.messageCase;
+  if (typeof details.interactionCase === "string") event.interactionCase = details.interactionCase;
+  if (typeof details.toolCount === "number") event.toolCount = details.toolCount;
+  if (typeof details.exitCode === "number") event.exitCode = details.exitCode;
+  if (typeof details.errorName === "string") event.errorName = details.errorName;
+  console.error(JSON.stringify(event));
+}
 
 export interface CursorAuthParams {
   verifier: string;
@@ -89,16 +143,21 @@ export async function pollCursorAuth(
 export async function refreshCursorToken(
   refreshToken: string,
 ): Promise<CursorCredentials> {
-  const response = await fetch(CURSOR_REFRESH_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${refreshToken}`,
-      "Content-Type": "application/json",
-    },
-    body: "{}",
-  });
+  emitLifecycleDiagnostic("auth", "auth_refresh_start");
+  let response: Response;
+  try {
+    response = await fetch(CURSOR_REFRESH_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${refreshToken}`, "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } catch (error) {
+    emitLifecycleDiagnostic("auth", "auth_refresh_failed", { errorName: error instanceof Error ? error.name : "UnknownError" });
+    throw error;
+  }
 
   if (!response.ok) {
+    emitLifecycleDiagnostic("auth", "auth_refresh_failed", { exitCode: response.status });
     const error = await response.text();
     throw new Error(`Cursor token refresh failed: ${error}`);
   }
@@ -108,11 +167,13 @@ export async function refreshCursorToken(
     refreshToken: string;
   };
 
-  return {
+  const credentials = {
     access: data.accessToken,
     refresh: data.refreshToken || refreshToken,
     expires: getTokenExpiry(data.accessToken),
   };
+  emitLifecycleDiagnostic("auth", "auth_refresh_complete");
+  return credentials;
 }
 
 

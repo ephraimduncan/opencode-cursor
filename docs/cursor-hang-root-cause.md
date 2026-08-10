@@ -111,8 +111,25 @@ The dropped overlay hunks address **none** of these; the kept hunks improve obse
   tool-call frame; bridge retained for resume). Implemented in the hardening pass.
 - **Semantic-progress stall detector (replaces P-3):** termination must be driven by the
   absence of *semantic* progress (output deltas, tool transitions, terminal frames) and by
-  transport-liveness signals (HTTP/2 PING, session/stream lifecycle), never by raw-byte
-  elapsed time. Implemented in the hardening pass.
+   transport-liveness signals (HTTP/2 PING, session/stream lifecycle), never by raw-byte
+   elapsed time. Implemented in the hardening pass.
+
+## Safe lifecycle diagnostics
+
+Set `CURSOR_PROXY_DIAGNOSTICS=1` to emit one-line JSON lifecycle records to stderr. The default
+is disabled. Every record contains a per-request `requestId` and monotonic `elapsedMs`; bridge
+records carry the same ID and include the parent elapsed time at spawn for cross-process ordering.
+
+The stage inventory is: `auth_access_start`, `auth_access_complete`, refresh start/complete/fail,
+`proxy_entry`, `bridge_spawn`, `bridge_start`, `h2_connect`, `connect_stream`, first
+`bridge_data`, first `connect_frame`, `message_dispatch`, `tool_pause`, `tool_resume`, first
+`sse_emission`, and `terminal`. Conditional tool stages appear only for tool-call requests.
+
+Diagnostics use a strict allowlist: source, stage, request ID, elapsed time, byte length, message
+case, interaction case, tool count, status/exit code, and error class. They never serialize auth
+tokens or headers, cookies, prompt/message text, tool arguments/results, or blob/checkpoint IDs.
+The parent always drains child stderr even while diagnostics are disabled, preventing pipe
+backpressure from stalling the bridge.
 
 ## Evidence sources
 

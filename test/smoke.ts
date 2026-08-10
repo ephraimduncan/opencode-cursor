@@ -68,6 +68,23 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
+function frameConnectEndStream(payload: Uint8Array): Buffer {
+  const frame = frameConnectUnaryMessage(payload);
+  frame[0] = 0b00000010;
+  return frame;
+}
+
+async function captureDiagnosticOutput<T>(operation: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+  try {
+    return { result: await operation(), lines };
+  } finally {
+    console.error = original;
+  }
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -113,7 +130,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         ":status": 200,
         "content-type": "application/connect+proto",
       });
-      stream.end();
+      stream.end(Buffer.concat([
+        frameConnectUnaryMessage(new Uint8Array()),
+        frameConnectEndStream(new TextEncoder().encode("{}")),
+      ]));
       return;
     }
 
@@ -400,6 +420,64 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Array content parsing OK");
 }
 
+async function testLifecycleDiagnostics(modules: TestModules) {
+  console.log("[test] Testing redacted lifecycle diagnostics...");
+  const originalSetting = process.env.CURSOR_PROXY_DIAGNOSTICS;
+  const fakeToken = "fake-access-token-DO-NOT-LOG";
+  const secretPrompt = "prompt-content-DO-NOT-LOG";
+  const secretToolPayload = "tool-payload-DO-NOT-LOG";
+  const request = {
+    model: "test",
+    stream: true,
+    messages: [{ role: "user", content: secretPrompt }],
+    tools: [{
+      type: "function",
+      function: { name: "example", parameters: { type: "object", example: secretToolPayload } },
+    }],
+  };
+  const runRequest = async () => {
+    const port = await modules.startProxy(async () => fakeToken);
+    const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${fakeToken}` },
+      body: JSON.stringify(request),
+    });
+    await response.text();
+    await Bun.sleep(150);
+    modules.stopProxy();
+  };
+
+  try {
+    delete process.env.CURSOR_PROXY_DIAGNOSTICS;
+    const disabled = await captureDiagnosticOutput(runRequest);
+    assertEqual(disabled.lines.length, 0, "Diagnostics must be silent when disabled");
+
+    process.env.CURSOR_PROXY_DIAGNOSTICS = "1";
+    const enabled = await captureDiagnosticOutput(runRequest);
+    const events = enabled.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const stages = new Set(events.map((event) => event.stage));
+    for (const stage of [
+      "proxy_entry", "auth_access_start", "auth_access_complete", "bridge_spawn",
+      "bridge_start", "h2_connect", "connect_stream", "bridge_data", "connect_frame",
+      "message_dispatch", "sse_emission", "terminal",
+    ]) {
+      assert(stages.has(stage), `Missing diagnostic lifecycle stage: ${stage}`);
+    }
+    const requestIds = new Set(events.map((event) => event.requestId));
+    assertEqual(requestIds.size, 1, "Expected one shared diagnostic correlation ID");
+    assert(events.every((event) => typeof event.elapsedMs === "number"), "Expected monotonic diagnostic timing");
+    const output = enabled.lines.join("\n");
+    for (const secret of [fakeToken, secretPrompt, secretToolPayload]) {
+      assert(!output.includes(secret), `Diagnostic output leaked secret: ${secret}`);
+    }
+  } finally {
+    if (originalSetting === undefined) delete process.env.CURSOR_PROXY_DIAGNOSTICS;
+    else process.env.CURSOR_PROXY_DIAGNOSTICS = originalSetting;
+    modules.stopProxy();
+  }
+  console.log("[test] Redacted lifecycle diagnostics OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -537,6 +615,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
+    await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

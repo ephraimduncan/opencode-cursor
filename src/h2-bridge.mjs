@@ -83,9 +83,31 @@ const configBuf = await readMessage();
 if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
-const { accessToken, url, path: rpcPath, unary } = config;
+const { accessToken, url, path: rpcPath, unary, diagnostic: diagnosticContext, diagnosticsEnabled } = config;
+const diagnosticStartedAt = performance.now();
+const emittedStages = new Set();
+
+// This is deliberately an allowlist. Transport errors, headers, payloads,
+// and request configuration values are never serialized.
+function emitDiagnostic(stage, details = {}) {
+  if (!diagnosticsEnabled || !diagnosticContext?.requestId || emittedStages.has(stage)) return;
+  emittedStages.add(stage);
+  const event = {
+    source: "bridge",
+    stage,
+    requestId: diagnosticContext.requestId,
+    elapsedMs: Math.round(performance.now() - diagnosticStartedAt),
+    parentElapsedMs: diagnosticContext.elapsedMs,
+  };
+  for (const key of ["byteLength", "status", "exitCode"])
+    if (typeof details[key] === "number") event[key] = details[key];
+  if (typeof details.errorName === "string") event.errorName = details.errorName;
+  try { process.stderr.write(`${JSON.stringify(event)}\n`); } catch {}
+}
+emitDiagnostic("bridge_start");
 
 const client = http2.connect(url || "https://api2.cursor.sh");
+client.on("connect", () => emitDiagnostic("h2_connect"));
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
@@ -104,9 +126,7 @@ function killBridge() {
 
 client.on("error", (err) => {
   clearTimeout(timeout);
-  // Write the error to stderr so the parent process can see it.
-  // Without this, errors are silently swallowed.
-  try { process.stderr.write(`[h2-bridge] client error: ${err.message}\n`); } catch {}
+  emitDiagnostic("terminal", { errorName: err?.name || "Error", exitCode: 1 });
   process.exit(1);
 });
 
@@ -125,15 +145,18 @@ if (!unary) {
   headers["connect-protocol-version"] = "1";
 }
 const h2Stream = client.request(headers);
+emitDiagnostic("connect_stream");
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
   resetTimeout();
+  emitDiagnostic("bridge_data", { byteLength: chunk.length });
   writeMessage(chunk);
 });
 
 h2Stream.on("end", () => {
   clearTimeout(timeout);
+  emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
   // Give stdout time to flush
   setTimeout(() => process.exit(0), 100);
@@ -141,7 +164,7 @@ h2Stream.on("end", () => {
 
 h2Stream.on("error", (err) => {
   clearTimeout(timeout);
-  try { process.stderr.write(`[h2-bridge] stream error: ${err.message}\n`); } catch {}
+  emitDiagnostic("terminal", { errorName: err?.name || "Error", exitCode: 1 });
   try { client.close(); } catch {}
   process.exit(1);
 });

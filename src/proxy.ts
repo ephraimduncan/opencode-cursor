@@ -78,6 +78,12 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
+import {
+  emitLifecycleDiagnostic,
+  lifecycleDiagnosticContextInfo,
+  lifecycleDiagnosticsEnabled,
+  withLifecycleDiagnosticContext,
+} from "./auth";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -294,6 +300,7 @@ interface SpawnBridgeOptions {
   url?: string;
   /** When true, use application/proto for unary RPCs instead of Connect streaming. */
   unary?: boolean;
+  diagnostic?: { requestId: string; elapsedMs: number };
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -310,25 +317,53 @@ function spawnBridge(options: SpawnBridgeOptions): {
     stdout: "pipe",
     stderr: "pipe",
   });
+  emitLifecycleDiagnostic("proxy", "bridge_spawn");
 
   const config = JSON.stringify({
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
     unary: options.unary ?? false,
+    diagnostic: options.diagnostic,
+    diagnosticsEnabled: lifecycleDiagnosticsEnabled(),
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
-  // Forward stderr to console for debugging. Without this, bridge errors
-  // are silently swallowed and the proxy appears to hang for no reason.
+  // Always drain stderr: an unread pipe can block the child. Only allowlisted
+  // diagnostic records are emitted, and only when explicitly enabled.
   (async () => {
     try {
       const reader = proc.stderr.getReader();
+      let pending = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const text = new TextDecoder().decode(value);
-        if (text.trim()) console.error(`[h2-bridge] ${text.trimEnd()}`);
+        pending += new TextDecoder().decode(value, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!lifecycleDiagnosticsEnabled()) continue;
+          try {
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            const diagnosticRequestId = options.diagnostic?.requestId;
+            if (!diagnosticRequestId || parsed.source !== "bridge" || parsed.requestId !== diagnosticRequestId) continue;
+            const bridgeStages = new Set([
+              "bridge_start", "h2_connect", "connect_stream", "bridge_data", "terminal",
+            ]);
+            if (typeof parsed.stage !== "string" || !bridgeStages.has(parsed.stage)) continue;
+            const event: Record<string, string | number> = {
+              source: "bridge",
+              stage: parsed.stage,
+              requestId: diagnosticRequestId,
+              elapsedMs: typeof parsed.elapsedMs === "number" ? parsed.elapsedMs : 0,
+            };
+            for (const key of ["parentElapsedMs", "byteLength", "status", "exitCode"] as const) {
+              if (typeof parsed[key] === "number") event[key] = parsed[key];
+            }
+            if (typeof parsed.errorName === "string") event.errorName = parsed.errorName;
+            console.error(JSON.stringify(event));
+          } catch {}
+        }
       }
     } catch {}
   })();
@@ -498,22 +533,28 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        try {
-          const body = (await req.json()) as ChatCompletionRequest;
-          if (!proxyAccessTokenProvider) {
-            throw new Error("Cursor proxy access token provider not configured");
+        return withLifecycleDiagnosticContext(crypto.randomUUID(), async () => {
+          try {
+            emitLifecycleDiagnostic("proxy", "proxy_entry");
+            const body = (await req.json()) as ChatCompletionRequest;
+            if (!proxyAccessTokenProvider) {
+              throw new Error("Cursor proxy access token provider not configured");
+            }
+            emitLifecycleDiagnostic("proxy", "auth_access_start");
+            const accessToken = await proxyAccessTokenProvider();
+            emitLifecycleDiagnostic("proxy", "auth_access_complete");
+            return handleChatCompletion(body, accessToken);
+          } catch (err) {
+            emitLifecycleDiagnostic("proxy", "terminal", {
+              errorName: err instanceof Error ? err.name : "UnknownError",
+            });
+            const message = err instanceof Error ? err.message : String(err);
+            return new Response(
+              JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }),
+              { status: 500, headers: { "Content-Type": "application/json" } },
+            );
           }
-          const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return new Response(
-            JSON.stringify({
-              error: { message, type: "server_error", code: "internal_error" },
-            }),
-            { status: 500, headers: { "Content-Type": "application/json" } },
-          );
-        }
+        });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -1384,6 +1425,7 @@ function createBridgeStreamResponse(
       let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
+        emitLifecycleDiagnostic("proxy", "sse_emission");
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       };
       const sendDone = () => {
@@ -1393,6 +1435,7 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        emitLifecycleDiagnostic("proxy", "terminal");
         controller.close();
       };
 
@@ -1431,6 +1474,7 @@ function createBridgeStreamResponse(
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
+          emitLifecycleDiagnostic("proxy", "connect_frame", { byteLength: messageBytes.length });
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -1454,6 +1498,7 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                emitLifecycleDiagnostic("proxy", "tool_pause");
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -1500,6 +1545,12 @@ function createBridgeStreamResponse(
                 }
               },
             );
+            emitLifecycleDiagnostic("proxy", "message_dispatch", {
+              messageCase: serverMessage.message.case,
+              interactionCase: serverMessage.message.case === "interactionUpdate"
+                ? serverMessage.message.value.message?.case
+                : undefined,
+            });
           } catch {
             // Skip unparseable messages
           }
@@ -1528,6 +1579,7 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        emitLifecycleDiagnostic("proxy", "terminal", { exitCode: code });
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1569,6 +1621,7 @@ function startBridge(
   const bridge = spawnBridge({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
+    diagnostic: lifecycleDiagnosticContextInfo(),
   });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
@@ -1600,6 +1653,7 @@ function handleToolResultResume(
   convKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
+  emitLifecycleDiagnostic("proxy", "tool_resume", { toolCount: toolResults.length });
 
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
