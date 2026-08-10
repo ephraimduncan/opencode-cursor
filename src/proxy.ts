@@ -65,6 +65,7 @@ import {
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionUpdate,
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
@@ -1053,11 +1054,14 @@ function createThinkingTagFilter(): {
   };
 }
 
-interface StreamState {
+export interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
+  /** Semantic progress only; liveness and checkpoint traffic must not update it. */
+  semanticProgressCount: number;
+  lastSemanticProgressAt: number;
 }
 
 function computeUsage(state: StreamState) {
@@ -1067,7 +1071,7 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
-function processServerMessage(
+export function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1077,51 +1081,104 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onProtocolError?: (error: Error) => void,
 ): void {
-  const msgCase = msg.message.case;
+  const markSemanticProgress = () => {
+    state.semanticProgressCount += 1;
+    state.lastSemanticProgressAt = Date.now();
+  };
 
-  if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText);
-  } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
-  } else if (msgCase === "execServerMessage") {
-    handleExecMessage(
-      msg.message.value as ExecServerMessage,
-      mcpTools,
-      cloudRule,
-      sendFrame,
-      onMcpExec,
-    );
-  } else if (msgCase === "conversationCheckpointUpdate") {
-    const stateStructure = msg.message.value as ConversationStateStructure;
-    if (stateStructure.tokenDetails) {
-      state.totalTokens = stateStructure.tokenDetails.usedTokens;
+  switch (msg.message.case) {
+    case "interactionUpdate":
+      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress);
+      return;
+    case "kvServerMessage":
+      handleKvMessage(msg.message.value, blobStore, sendFrame);
+      return;
+    case "execServerMessage":
+      markSemanticProgress();
+      handleExecMessage(msg.message.value, mcpTools, cloudRule, sendFrame, onMcpExec);
+      return;
+    case "conversationCheckpointUpdate": {
+      const stateStructure = msg.message.value;
+      if (stateStructure.tokenDetails) state.totalTokens = stateStructure.tokenDetails.usedTokens;
+      if (onCheckpoint) onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+      return;
     }
-    if (onCheckpoint) {
-      onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+    case "execServerControlMessage":
+      // Cursor's abort control has no OpenAI-compatible acknowledgement path.
+      // Failing is safer than leaving the server waiting for an unsupported response.
+      onProtocolError?.(new Error(`Unsupported Cursor exec control message: ${msg.message.value.message.case ?? "unknown"}`));
+      return;
+    case "interactionQuery":
+      // Query answers may require user interaction or Cursor-specific capabilities that
+      // this proxy cannot provide. Never silently leave the server waiting for one.
+      onProtocolError?.(new Error(`Unsupported Cursor interaction query: ${msg.message.value.query.case ?? "unknown"}`));
+      return;
+    case undefined:
+      onProtocolError?.(new Error("Cursor server message had no message case"));
+      return;
+    default: {
+      const unhandled: never = msg.message;
+      throw new Error(`Unhandled Cursor server message: ${String(unhandled)}`);
     }
   }
 }
 
 function handleInteractionUpdate(
-  update: any,
+  update: InteractionUpdate,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  markSemanticProgress: () => void,
 ): void {
-  const updateCase = update.message?.case;
-
-  if (updateCase === "textDelta") {
-    const delta = update.message.value.text || "";
-    if (delta) onText(delta, false);
-  } else if (updateCase === "thinkingDelta") {
-    const delta = update.message.value.text || "";
-    if (delta) onText(delta, true);
-  } else if (updateCase === "tokenDelta") {
-    state.outputTokens += update.message.value.tokens ?? 0;
+  switch (update.message.case) {
+    case "textDelta": {
+      const delta = update.message.value.text || "";
+      if (delta) {
+        markSemanticProgress();
+        onText(delta, false);
+      }
+      return;
+    }
+    case "thinkingDelta": {
+      const delta = update.message.value.text || "";
+      if (delta) {
+        markSemanticProgress();
+        onText(delta, true);
+      }
+      return;
+    }
+    case "tokenDelta": {
+      const tokens = update.message.value.tokens ?? 0;
+      state.outputTokens += tokens;
+      if (tokens > 0) markSemanticProgress();
+      return;
+    }
+    // Tool calls are handled through execServerMessage, not InteractionUpdate.
+    case "partialToolCall":
+    case "toolCallDelta":
+    case "toolCallStarted":
+    case "toolCallCompleted":
+    // These update Cursor's internal transcript or UI but do not establish model progress.
+    case "thinkingCompleted":
+    case "userMessageAppended":
+    case "summary":
+    case "summaryStarted":
+    case "summaryCompleted":
+    case "shellOutputDelta":
+    case "stepStarted":
+    case "stepCompleted":
+    // Cursor's turnEnded sequencing is unproven, so only a Connect end-stream may terminate.
+    case "heartbeat":
+    case "turnEnded":
+      return;
+    case undefined:
+      return;
+    default: {
+      const unhandled: never = update.message;
+      throw new Error(`Unhandled Cursor interaction update: ${String(unhandled)}`);
+    }
   }
-  // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
-  // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1470,6 +1527,8 @@ function createBridgeStreamResponse(
         pendingExecs: [],
         outputTokens: 0,
         totalTokens: 0,
+        semanticProgressCount: 0,
+        lastSemanticProgressAt: Date.now(),
       };
       const tagFilter = createThinkingTagFilter();
 
@@ -1572,6 +1631,10 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
+              },
+              (error) => {
+                finishTerminal(error);
+                bridge.end();
               },
             );
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
@@ -1789,7 +1852,7 @@ async function collectFullResponse(
   accessToken: string,
   convKey: string,
 ): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
+  const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
@@ -1799,6 +1862,8 @@ async function collectFullResponse(
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    semanticProgressCount: 0,
+    lastSemanticProgressAt: Date.now(),
   };
   const tagFilter = createThinkingTagFilter();
 
@@ -1830,6 +1895,11 @@ async function collectFullResponse(
               stored.lastAccessMs = Date.now();
               persistConversation(convKey, stored);
             }
+          },
+          (error) => {
+            clearInterval(heartbeatTimer);
+            bridge.end();
+            reject(error);
           },
         );
       } catch {

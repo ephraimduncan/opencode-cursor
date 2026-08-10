@@ -3,8 +3,16 @@ import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentServerMessageSchema,
+  ConversationStateStructureSchema,
+  ExecServerControlMessageSchema,
   GetUsableModelsResponseSchema,
+  HeartbeatUpdateSchema,
+  InteractionQuerySchema,
+  InteractionUpdateSchema,
   ModelDetailsSchema,
+  TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 import {
   CURSOR_SCENARIOS,
@@ -23,6 +31,7 @@ interface TestModules {
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
+  processServerMessage: typeof import("../src/proxy").processServerMessage;
 }
 
 interface TestCursorBackend {
@@ -246,6 +255,7 @@ async function loadModules(): Promise<TestModules> {
     CursorAuthPlugin: index.CursorAuthPlugin,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
+    processServerMessage: proxy.processServerMessage,
   };
 }
 
@@ -615,6 +625,50 @@ async function testStreamingTerminationKnownFailures() {
   console.log("[test] Slow semantic progress survives bounded streaming completion");
 }
 
+async function testServerMessageClassification(modules: TestModules) {
+  console.log("[test] Testing server-message progress and unsupported-query classification...");
+  const state = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+    semanticProgressCount: 0,
+    lastSemanticProgressAt: 0,
+  };
+  const dispatch = (message: Parameters<typeof create>[1], onProtocolError?: (error: Error) => void) =>
+    modules.processServerMessage(
+      create(AgentServerMessageSchema, message as never),
+      new Map(), [], undefined, () => {}, state, () => {}, () => {}, undefined, onProtocolError,
+    );
+
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+  }) } });
+  dispatch({ message: { case: "conversationCheckpointUpdate", value: create(ConversationStateStructureSchema, {}) } });
+  assertEqual(state.semanticProgressCount, 0, "Heartbeat, turnEnded, and checkpoints must not count as semantic progress");
+
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "progress" }) },
+  }) } });
+  assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
+
+  let unsupportedError: Error | undefined;
+  dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
+    id: 1,
+    query: { case: "webSearchRequestQuery", value: {} },
+  }) } }, (error) => { unsupportedError = error; });
+  assert(unsupportedError?.message.includes("Unsupported Cursor interaction query"), "Unsupported blocking queries must trigger an explicit terminal error");
+  unsupportedError = undefined;
+  dispatch({ message: { case: "execServerControlMessage", value: create(ExecServerControlMessageSchema, {
+    message: { case: "abort", value: { id: 1 } },
+  }) } }, (error) => { unsupportedError = error; });
+  assert(unsupportedError?.message.includes("Unsupported Cursor exec control message"), "Unsupported control messages must trigger an explicit terminal error");
+  console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
+}
+
 async function runScenarioSubprocess(
   apiUrl: string,
   script: string,
@@ -957,6 +1011,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testFakeCursorScenarioHarness();
     await testStreamingTerminationKnownFailures();
+    await testServerMessageClassification(modules);
     await testResumeRefreshAndNonStreamingKnownFailures();
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
