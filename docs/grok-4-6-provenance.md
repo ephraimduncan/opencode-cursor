@@ -30,8 +30,8 @@ Cloudflare (`fn_20260812_vaamzb8z`).
 context, pricing, reasoning effort) come from `docs.x.ai`. The plugin proxies Cursor's Connect API,
 so catalog limits should mirror the Cursor-facing 256K value; the 500K API discrepancy is documented
 rather than hidden (`fn_20260812_vaamzb8z`, `fn_20260812_o13isq9e`). The existing `/grok/i` cost
-pattern already routes `grok-4.6` to the `grok-4.20` key, whose $2/$6 rates match Grok 4.5/4.6
-short-context pricing; `grok-4.20` itself is a different xAI model at $1.25/$2.50
+pattern already routes `grok-4.6` to the `grok-4.20` key (`fn_20260812_uejn0r60`), whose $2/$6 rates
+match Grok 4.5/4.6 short-context pricing; `grok-4.20` itself is a different xAI model at $1.25/$2.50
 (`fn_20260812_o13isq9e`, https://docs.x.ai/developers/models/grok-4.20-experimental-beta-0304).
 
 ## 2. Explicit uncertainty
@@ -151,8 +151,9 @@ closed-state now belongs to the shared response owner and `ReadableStream.cancel
 clearing the watchdog/heartbeat, removing matching paused indexes, and terminating the bridge. It
 does **not** enqueue or close the already consumer-cancelled controller, so late bridge callbacks
 cannot write or produce a second close. `test/smoke.ts` uses the deterministic `client-abort` fake
-Connect scenario to read one SSE frame, cancel the reader, and prove fixture-level H2/session cleanup
-plus zero retained active bridges. Typecheck and the full deterministic smoke suite pass (2026-08-12).
+Connect scenario to read one SSE frame, cancel the reader, and prove fixture-observed H2/session
+cleanup, with zero retained proxy-side active bridges verified by source inspection. Typecheck and
+the full deterministic smoke suite pass (2026-08-12).
 
 Evidence: origin PR [#34](https://github.com/ephraimduncan/opencode-cursor/pull/34) (+4/-1,
 `closed` set by `cancel()`); `fn_20260812_gz125m33`; `src/proxy.ts:createBridgeStreamResponse`;
