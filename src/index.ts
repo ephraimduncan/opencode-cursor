@@ -15,9 +15,9 @@ import {
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
-} from "./auth";
-import { getCursorModels, type CursorModel } from "./models";
-import { startProxy } from "./proxy";
+} from "./auth.js";
+import { getCursorModels, type CursorModel } from "./models.js";
+import { startProxy } from "./proxy.js";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -448,4 +448,14 @@ function estimateModelCost(modelId: string): ModelCost {
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 
-export default CursorAuthPlugin;
+/**
+ * Modern plugin module format: `{ id, server }`. Newer opencode loaders
+ * (including the Desktop app's sidecar) require this shape; the bare
+ * function default export was silently ignored there.
+ */
+export const CursorAuthPluginModule = {
+  id: "opencode-cursor-oauth",
+  server: CursorAuthPlugin,
+};
+
+export default CursorAuthPluginModule;

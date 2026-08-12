@@ -42,7 +42,7 @@ import {
   type ExecServerMessage,
   type LsDirectoryTreeNode,
   type McpToolDefinition,
-} from "./proto/agent_pb";
+} from "./proto/agent_pb.js";
 
 export type NativeResultType =
   | "readResult"
