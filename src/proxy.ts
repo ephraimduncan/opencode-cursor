@@ -1609,11 +1609,14 @@ function createBridgeStreamResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   let cancelStream = () => {};
+  // `cancel()` is invoked outside the stream source's `start()` callback. Keep
+  // this state in the shared response owner so an aborted client prevents all
+  // later terminal or model-output writes to its already-cancelled controller.
+  let closed = false;
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
         emitLifecycleDiagnostic("proxy", "sse_emission");
@@ -1691,6 +1694,9 @@ function createBridgeStreamResponse(
       cancelStream = () => {
         if (terminal) return;
         terminal = true;
+        // The consumer owns the controller after cancellation. Do not call
+        // controller.close() or enqueue a terminal SSE frame here.
+        closed = true;
         semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
         for (const active of activeBridges.values()) {

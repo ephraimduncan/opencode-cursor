@@ -34,6 +34,7 @@ export type CursorScenario =
   | "frame-error"
   | "goaway"
   | "stream-aborted"
+  | "client-abort"
   | "silent-transport"
   | "transport-death"
   | "tool-pause-resume"
@@ -60,6 +61,7 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "frame-error",
   "goaway",
   "stream-aborted",
+  "client-abort",
   "silent-transport",
   "transport-death",
   "tool-pause-resume",
@@ -355,6 +357,11 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       case "stream-aborted":
         stream.write(frameConnectMessage(textDelta("before-abort")));
         setTimeout(() => stream.close(http2.constants.NGHTTP2_CANCEL), 10);
+        break;
+      case "client-abort":
+        // Send one frame, then intentionally remain open. The smoke test owns
+        // the consumer-side cancel and must cause this H2 stream to disappear.
+        stream.write(frameConnectMessage(textDelta("abort-ready")));
         break;
       case "silent-transport":
         // Keep the H2 connection open without emitting frames. Tests lower the

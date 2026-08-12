@@ -716,6 +716,38 @@ async function testStreamingTermination() {
   console.log("[test] Repeated semantic progress re-arms the between-progress bound");
 }
 
+async function testClientAbortTeardown() {
+  console.log("[test] Testing client-abort stream teardown...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("client-abort");
+  try {
+    const result = await runScenarioSubprocess(fixture.apiUrl, `
+      import { startProxy, stopProxy } from "./src/proxy.ts";
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "cancel this response" }] }),
+      });
+      const reader = response.body.getReader();
+      let text = "";
+      while (!text.includes("abort-ready")) {
+        const next = await reader.read();
+        if (next.done) break;
+        text += new TextDecoder().decode(next.value, { stream: true });
+      }
+      await reader.cancel();
+      await Bun.sleep(25);
+      stopProxy();
+      console.log(JSON.stringify({ received: text.includes("abort-ready") }));
+    `);
+    assertEqual(result.received, true, "Client-abort fixture must deliver output before cancellation");
+    fixture.assertClean();
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Client abort closes the controller path and tears down bridge resources");
+}
+
 async function testServerMessageClassification(modules: TestModules) {
   console.log("[test] Testing server-message progress and unsupported-query classification...");
   const state = {
@@ -1197,6 +1229,7 @@ async function main() {
     await testNonStreamingProtocolErrorsAreStructured();
     await testFakeCursorScenarioHarness();
     await testStreamingTermination();
+    await testClientAbortTeardown();
     await testServerMessageClassification(modules);
     await testResumeRefreshAndNonStreaming(modules);
     await testLifecycleDiagnostics(modules);

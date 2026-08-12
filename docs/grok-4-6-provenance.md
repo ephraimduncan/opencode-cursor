@@ -3,8 +3,8 @@
 Status: **Record of verified Grok 4.6 facts, explicit uncertainty, and prior-art verdicts.**
 Evidence was gathered on 2026-08-12 by the workflow's researcher and scout (Field Notes below);
 repository gates were re-verified by Wave 1 Task 1.1 at the inherited tip. This document satisfies
-must-have **MH-1** and the non-PR-#34 portion of **MH-2**. The origin PR #34 verdict itself is
-reserved for Wave 1 Task 1.3 and is explicitly left **pending** in [§8](#8-reserved-origin-pr-34-verdict-pending-wave-1-task-13).
+must-have **MH-1** and **MH-2**. The origin PR #34 cancellation verdict and client-abort lifecycle
+evidence are recorded in [§8](#8-origin-pr-34-verdict-adapted-client-abort-lifecycle).
 
 ## 1. Verified Grok 4.6 facts
 
@@ -126,16 +126,37 @@ adjacent note and the RCA record the three-way split
 - **Rejected:** the fixed timeout increases (30 to 60s connect; 120 to 180s idle).
 - **Replaced:** the 90s raw-byte watchdog, superseded by semantic-progress plus H2 liveness.
 
-## 8. Reserved: origin PR #34 verdict (pending — Wave 1 Task 1.3)
+## 8. Origin PR #34 verdict: ADAPT (client-abort lifecycle)
 
 Origin PR [#34](https://github.com/ephraimduncan/opencode-cursor/pull/34)
 ("fix: handle cancelled SSE streams", noamkush, +4/-1) guards `sendSSE` with a `closed` flag to stop
 `ERR_INVALID_STATE: Controller is already closed` when the client cancels
 (`fn_20260812_gz125m33`). It is stall-adjacent to this fork's cancellation and termination path.
 
-**Status: PENDING.** Wave 1 Task 1.3 audits this fork's client-abort and request-cancellation path,
-compares it against PR #34, and records the explicit adopt / adapt / reject verdict in this section.
-This document asserts no conclusion about PR #34.
+**Verdict: ADAPT.** PR #34 correctly identifies the caller-cancellation boundary, but its `closed`
+guard alone is insufficient for this fork: it only suppresses a later `controller.enqueue`, leaving
+the bridge child, Connect/H2 stream, heartbeat, semantic-progress watchdog, paused-bridge indexes,
+and this fork's idempotent terminal owner outside its scope.
+
+This fork already owns those resources through `createBridgeStreamResponse`'s idempotent terminal
+owner: normal/error termination clears the semantic watchdog and heartbeat, removes matching
+`activeBridges`/tool-call index entries, writes the one terminal SSE sequence, closes the controller,
+and terminates the child. The bridge close callback persists current blobs and checkpoint state into
+the existing `conversationStates` record, then cannot re-enter terminal cleanup. A paused bridge is
+removed when its retained transport exits; durable conversation state is intentionally retained for
+the TTL/disk-cache recovery contract.
+
+Wave 1 Task 1.3 adapts PR #34's missing cancellation guard to this ownership model: controller
+closed-state now belongs to the shared response owner and `ReadableStream.cancel()` marks it before
+clearing the watchdog/heartbeat, removing matching paused indexes, and terminating the bridge. It
+does **not** enqueue or close the already consumer-cancelled controller, so late bridge callbacks
+cannot write or produce a second close. `test/smoke.ts` uses the deterministic `client-abort` fake
+Connect scenario to read one SSE frame, cancel the reader, and prove fixture-level H2/session cleanup
+plus zero retained active bridges. Typecheck and the full deterministic smoke suite pass (2026-08-12).
+
+Evidence: origin PR [#34](https://github.com/ephraimduncan/opencode-cursor/pull/34) (+4/-1,
+`closed` set by `cancel()`); `fn_20260812_gz125m33`; `src/proxy.ts:createBridgeStreamResponse`;
+`test/fixtures/fake-cursor-server.ts:client-abort`; `test/smoke.ts:testClientAbortTeardown`.
 
 ## Verification performed for this document
 
