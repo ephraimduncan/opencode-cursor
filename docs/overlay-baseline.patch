@@ -1,0 +1,195 @@
+diff --git a/.gitignore b/.gitignore
+index 62ccde4..4d58f8d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,4 @@ node_modules/
+ dist/
+ *.tsbuildinfo
+ .DS_Store
++.goopspec/
+diff --git a/src/h2-bridge.mjs b/src/h2-bridge.mjs
+index e86132e..b16ca15 100644
+--- a/src/h2-bridge.mjs
++++ b/src/h2-bridge.mjs
+@@ -89,21 +89,28 @@ const client = http2.connect(url || "https://api2.cursor.sh");
+ 
+ // Guard against initial connection failure. Reset on any h2 activity
+ // so long-running agent conversations (with tool call round-trips) survive.
+-let timeout = setTimeout(killBridge, 30_000);
++// Initial connection timeout is generous because Cursor's server can be slow
++// to respond during peak load.
++let timeout = setTimeout(killBridge, 60_000);
+ 
+ function resetTimeout() {
+   clearTimeout(timeout);
+-  timeout = setTimeout(killBridge, 120_000);
++  // 180s idle timeout: long enough for Grok 4.5 thinking/tool-call pauses,
++  // short enough to not hang OpenCode indefinitely.
++  timeout = setTimeout(killBridge, 180_000);
+ }
+ 
+ function killBridge() {
+   clearTimeout(timeout);
+-  client.destroy();
++  try { client.destroy(); } catch {}
+   process.exit(1);
+ }
+ 
+-client.on("error", () => {
++client.on("error", (err) => {
+   clearTimeout(timeout);
++  // Write the error to stderr so the parent process can see it.
++  // Without this, errors are silently swallowed.
++  try { process.stderr.write(`[h2-bridge] client error: ${err.message}\n`); } catch {}
+   process.exit(1);
+ });
+ 
+@@ -136,9 +143,10 @@ h2Stream.on("end", () => {
+   setTimeout(() => process.exit(0), 100);
+ });
+ 
+-h2Stream.on("error", () => {
++h2Stream.on("error", (err) => {
+   clearTimeout(timeout);
+-  client.close();
++  try { process.stderr.write(`[h2-bridge] stream error: ${err.message}\n`); } catch {}
++  try { client.close(); } catch {}
+   process.exit(1);
+ });
+ 
+diff --git a/src/proxy.ts b/src/proxy.ts
+index 93c44ec..b74b2be 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -308,7 +308,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
+   const proc = Bun.spawn(["node", BRIDGE_PATH], {
+     stdin: "pipe",
+     stdout: "pipe",
+-    stderr: "ignore",
++    stderr: "pipe",
+   });
+ 
+   const config = JSON.stringify({
+@@ -319,6 +319,20 @@ function spawnBridge(options: SpawnBridgeOptions): {
+   });
+   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+ 
++  // Forward stderr to console for debugging. Without this, bridge errors
++  // are silently swallowed and the proxy appears to hang for no reason.
++  (async () => {
++    try {
++      const reader = proc.stderr.getReader();
++      while (true) {
++        const { done, value } = await reader.read();
++        if (done) break;
++        const text = new TextDecoder().decode(value);
++        if (text.trim()) console.error(`[h2-bridge] ${text.trimEnd()}`);
++      }
++    } catch {}
++  })();
++
+   const cbs = {
+     data: null as ((chunk: Buffer) => void) | null,
+     close: null as ((code: number) => void) | null,
+@@ -469,7 +483,7 @@ export async function startProxy(
+ 
+   proxyServer = Bun.serve({
+     port: 0,
+-    idleTimeout: 255, // max — Cursor responses can take 30s+
++    idleTimeout: 255, // max - Cursor responses can take 30s+, especially Grok 4.5
+     async fetch(req) {
+       const url = new URL(req.url);
+ 
+@@ -1511,10 +1525,50 @@ function createBridgeStreamResponse(
+         },
+       );
+ 
+-      bridge.onData(processChunk);
++      // --- Watchdog timer ---
++      // If no data arrives within TOOL_CALL_TIMEOUT_MS, force-close the stream
++      // so OpenCode doesn't hang waiting for a response that will never come.
++      // This catches: H2 socket close without Connect end-stream frame,
++      // silent server disconnects, and model stalls (especially Grok 4.5).
++      const TOOL_CALL_TIMEOUT_MS = 90_000; // 90s
++      let lastDataTime = Date.now();
++      const watchdog = setInterval(() => {
++        if (closed) {
++          clearInterval(watchdog);
++          return;
++        }
++        if (Date.now() - lastDataTime > TOOL_CALL_TIMEOUT_MS) {
++          clearInterval(watchdog);
++          if (!mcpExecReceived) {
++            const flushed = tagFilter.flush();
++            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
++            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
++          }
++          sendSSE(makeChunk({
++            content: "\n[Error: request timed out - no data from Cursor server]",
++          }));
++          sendSSE(makeChunk({}, "stop"));
++          sendSSE(makeUsageChunk());
++          sendDone();
++          closeController();
++          activeBridges.delete(bridgeKey);
++          clearInterval(heartbeatTimer);
++          bridge.end();
++        }
++      }, 5_000);
++
++      // Wrap processChunk to track data arrival for watchdog
++      const originalProcessChunk = processChunk;
++      const trackedProcessChunk = (incoming: Buffer) => {
++        lastDataTime = Date.now();
++        originalProcessChunk(incoming);
++      };
++
++      bridge.onData(trackedProcessChunk);
+ 
+       bridge.onClose((code) => {
+         clearInterval(heartbeatTimer);
++        clearInterval(watchdog);
+         const stored = conversationStates.get(convKey);
+         if (stored) {
+           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+@@ -1529,16 +1583,30 @@ function createBridgeStreamResponse(
+           sendSSE(makeUsageChunk());
+           sendDone();
+           closeController();
+-        } else if (code !== 0) {
+-          // Bridge died while tool calls are pending (timeout, crash, etc.).
+-          // Close the SSE stream so the client doesn't hang forever.
+-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+-          sendSSE(makeChunk({}, "stop"));
+-          sendSSE(makeUsageChunk());
+-          sendDone();
+-          closeController();
+-          // Remove stale entry so the next request doesn't try to resume it.
+-          activeBridges.delete(bridgeKey);
++        } else {
++          // Bridge closed while tool calls are pending.
++          // Whether the exit code is 0 (server clean-close) or non-zero
++          // (timeout/crash), if mcpExecReceived is true, the bridge is
++          // kept alive for continuation. When it dies unexpectedly, the
++          // next request will detect a dead bridge and fall through to a
++          // fresh one. But we must NOT close the SSE stream here when
++          // code === 0 and mcpExecReceived is true, because that means
++          // the tool calls were emitted and OpenCode is executing them.
++          // The stream was already closed by the onMcpExec handler.
++          if (code !== 0) {
++            // Bridge died with error while tool calls pending.
++            // Close the SSE stream so the client doesn't hang forever.
++            sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
++            sendSSE(makeChunk({}, "stop"));
++            sendSSE(makeUsageChunk());
++            sendDone();
++            closeController();
++            // Remove stale entry so the next request doesn't try to resume it.
++            activeBridges.delete(bridgeKey);
++          }
++          // When code === 0 and mcpExecReceived: the SSE stream was already
++          // closed by onMcpExec. Nothing more to do. The bridge is kept
++          // alive in activeBridges for the tool-result resume path.
+         }
+       });
+     },

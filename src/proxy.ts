@@ -65,6 +65,7 @@ import {
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionUpdate,
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
@@ -78,6 +79,13 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
+import {
+  CursorTokenRefreshTimeoutError,
+  emitLifecycleDiagnostic,
+  lifecycleDiagnosticContextInfo,
+  lifecycleDiagnosticsEnabled,
+  withLifecycleDiagnosticContext,
+} from "./auth";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -149,6 +157,10 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
+  /** Opaque proxy-generated handle; never derived from caller content. */
+  resumeId: string;
+  /** Cursor tool-call identifiers that resolve this exact paused interaction. */
+  toolCallIds: Set<string>;
   bridge: ReturnType<typeof spawnBridge>;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
@@ -157,10 +169,11 @@ interface ActiveBridge {
   pendingExecs: PendingExec[];
 }
 
-// Active bridges keyed by a session token (derived from conversation state).
-// When tool_calls are returned, the bridge stays alive. The next request
-// with tool results looks up the bridge and sends mcpResult messages.
+// Active bridges are keyed by an opaque, per-pause UUID. A separate index maps
+// Cursor's tool-call identifiers back to that UUID on the follow-up request.
+// Message content is deliberately not part of resume identity.
 const activeBridges = new Map<string, ActiveBridge>();
+const activeBridgeToolCalls = new Map<string, string>();
 
 interface StoredConversation {
   conversationId: string;
@@ -294,30 +307,87 @@ interface SpawnBridgeOptions {
   url?: string;
   /** When true, use application/proto for unary RPCs instead of Connect streaming. */
   unary?: boolean;
+  diagnostic?: { requestId: string; elapsedMs: number };
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
-  write: (data: Uint8Array) => void;
+  /** Returns false when the child has already exited or its stdin rejects the frame. */
+  write: (data: Uint8Array) => boolean;
   end: () => void;
+  /** Stop the child when this request has reached a non-resumable terminal state. */
+  terminate: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
   get alive(): boolean;
+  /** True only after the child reports a live, writable HTTP/2 transport. */
+  get writable(): boolean;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
   });
+  emitLifecycleDiagnostic("proxy", "bridge_spawn");
 
   const config = JSON.stringify({
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
     unary: options.unary ?? false,
+    diagnostic: options.diagnostic,
+    diagnosticsEnabled: lifecycleDiagnosticsEnabled(),
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+
+  // Always drain stderr: an unread pipe can block the child. Only allowlisted
+  // diagnostic records are emitted, and only when explicitly enabled.
+  (async () => {
+    try {
+      const reader = proc.stderr.getReader();
+      let pending = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += new TextDecoder().decode(value, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!lifecycleDiagnosticsEnabled()) continue;
+          try {
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            const diagnosticRequestId = options.diagnostic?.requestId;
+            if (!diagnosticRequestId || parsed.source !== "bridge" || parsed.requestId !== diagnosticRequestId) continue;
+            const bridgeStages = new Set([
+              "bridge_start", "h2_connect", "connect_stream", "bridge_data", "terminal",
+            ]);
+            if (typeof parsed.stage !== "string" || !bridgeStages.has(parsed.stage)) continue;
+            const event: Record<string, string | number> = {
+              source: "bridge",
+              stage: parsed.stage,
+              requestId: diagnosticRequestId,
+              elapsedMs: typeof parsed.elapsedMs === "number" ? parsed.elapsedMs : 0,
+            };
+            for (const key of ["parentElapsedMs", "byteLength", "status", "exitCode"] as const) {
+              if (typeof parsed[key] === "number") event[key] = parsed[key];
+            }
+            const allowedBridgeErrorNames = new Set([
+              "Timeout:connect", "Timeout:idle", "ConnectProtocolError", "BridgeWriteError",
+              "PingTimeout", "PingFailure", "Http2SessionError", "Http2Goaway",
+              "Http2FrameError", "Http2SessionTimeout", "Http2SessionClose",
+              "Http2StreamError", "Http2StreamAborted", "Http2StreamClose",
+            ]);
+            if (
+              typeof parsed.errorName === "string" &&
+              allowedBridgeErrorNames.has(parsed.errorName)
+            ) event.errorName = parsed.errorName;
+            console.error(JSON.stringify(event));
+          } catch {}
+        }
+      }
+    } catch {}
+  })();
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
@@ -327,6 +397,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   // Track exit state so late onClose registrations fire immediately.
   let exited = false;
   let exitCode = 1;
+  let writable = false;
 
   (async () => {
     const reader = proc.stdout.getReader();
@@ -343,7 +414,19 @@ function spawnBridge(options: SpawnBridgeOptions): {
           if (pending.length < 4 + len) break;
           const payload = pending.subarray(4, 4 + len);
           pending = pending.subarray(4 + len);
-          cbs.data?.(Buffer.from(payload));
+          // The child reserves the first byte for pipe-level control. H2 data
+          // remains opaque to this layer; control records only establish whether
+          // a retained bridge can safely accept a tool-result resume.
+          if (payload[0] === 1) {
+            try {
+              const status = JSON.parse(payload.subarray(1).toString("utf8"));
+              writable = status.transport === "writable";
+            } catch {
+              writable = false;
+            }
+          } else if (payload[0] === 0) {
+            cbs.data?.(Buffer.from(payload.subarray(1)));
+          }
         }
       }
     } catch {
@@ -359,14 +442,25 @@ function spawnBridge(options: SpawnBridgeOptions): {
   return {
     proc,
     get alive() { return !exited; },
+    get writable() { return !exited && writable; },
     write(data) {
-      try { proc.stdin.write(lpEncode(data)); } catch {}
+      if (exited) return false;
+      try {
+        proc.stdin.write(lpEncode(data));
+        return true;
+      } catch {
+        return false;
+      }
     },
     end() {
       try {
         proc.stdin.write(lpEncode(new Uint8Array(0)));
         proc.stdin.end();
       } catch {}
+    },
+    terminate() {
+      try { proc.stdin.end(); } catch {}
+      try { proc.kill(); } catch {}
     },
     onData(cb) { cbs.data = cb; },
     onClose(cb) {
@@ -454,6 +548,11 @@ export function getProxyPort(): number | undefined {
   return proxyPort;
 }
 
+/** Visible for lifecycle assertions; retained bridges are never resumable after termination. */
+export function getActiveBridgeCount(): number {
+  return activeBridges.size;
+}
+
 export async function startProxy(
   getAccessToken: () => Promise<string>,
   models: ReadonlyArray<{ id: string; name: string }> = [],
@@ -484,22 +583,41 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        try {
-          const body = (await req.json()) as ChatCompletionRequest;
-          if (!proxyAccessTokenProvider) {
-            throw new Error("Cursor proxy access token provider not configured");
+        return withLifecycleDiagnosticContext(crypto.randomUUID(), async () => {
+          try {
+            emitLifecycleDiagnostic("proxy", "proxy_entry");
+            const body = (await req.json()) as ChatCompletionRequest;
+            if (!proxyAccessTokenProvider) {
+              throw new Error("Cursor proxy access token provider not configured");
+            }
+            emitLifecycleDiagnostic("proxy", "auth_access_start");
+            const accessToken = await proxyAccessTokenProvider();
+            emitLifecycleDiagnostic("proxy", "auth_access_complete");
+            // Await so failures from either streaming or non-streaming handling
+            // remain inside this request's structured-error boundary.
+            return await handleChatCompletion(body, accessToken);
+          } catch (err) {
+            emitLifecycleDiagnostic("proxy", "terminal", {
+              errorName: err instanceof Error ? err.name : "UnknownError",
+            });
+            const message = err instanceof Error ? err.message : String(err);
+            const refreshTimedOut = err instanceof CursorTokenRefreshTimeoutError;
+            const responseStalled = err instanceof CursorResponseStallTimeoutError;
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message,
+                  type: refreshTimedOut || responseStalled ? "gateway_timeout" : "server_error",
+                  code: refreshTimedOut ? "token_refresh_timeout" : responseStalled ? "response_stall_timeout" : "internal_error",
+                },
+              }),
+              {
+                status: refreshTimedOut || responseStalled ? 504 : 500,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
           }
-          const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return new Response(
-            JSON.stringify({
-              error: { message, type: "server_error", code: "internal_error" },
-            }),
-            { status: 500, headers: { "Content-Type": "application/json" } },
-          );
-        }
+        });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -548,18 +666,19 @@ async function handleChatCompletion(
     );
   }
 
-  // bridgeKey: model-specific, for active tool-call bridges
-  // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
+  // A tool-result request has no trustworthy conversation ID in OpenAI's wire
+  // shape. Its tool_call_id is the only identifier bound to the paused server
+  // interaction, so resolve exclusively through that index and fail closed on
+  // missing, ambiguous, or conflicting IDs.
   const convKey = deriveConversationKey(body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
+  const activeBridge = findPausedBridge(toolResults);
 
   if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+    removeActiveBridge(activeBridge);
 
-    if (activeBridge.bridge.alive) {
+    if (activeBridge.bridge.writable) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, userText, modelId, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -569,10 +688,10 @@ async function handleChatCompletion(
   }
 
   // Clean up stale bridge if present
-  if (activeBridge && activeBridges.has(bridgeKey)) {
+  if (activeBridge && activeBridges.has(activeBridge.resumeId)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    removeActiveBridge(activeBridge);
   }
 
   let stored = conversationStates.get(convKey);
@@ -602,7 +721,7 @@ async function handleChatCompletion(
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, convKey);
 }
 
 interface ToolResultInfo {
@@ -890,6 +1009,8 @@ function buildCursorRequest(
 }
 
 function parseConnectEndStream(data: Uint8Array): Error | null {
+  if (data.length === 0) return null;
+
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
@@ -996,11 +1117,71 @@ function createThinkingTagFilter(): {
   };
 }
 
-interface StreamState {
+export interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
+  /** Semantic progress only; liveness and checkpoint traffic must not update it. */
+  semanticProgressCount: number;
+  lastSemanticProgressAt: number;
+}
+
+// The initial wait is deliberately longer: reasoning models may queue and
+// plan for minutes before emitting their first token. Afterwards, ten
+// minutes still accommodates extended thinking while bounding heartbeat-only
+// stalls. Hard caps keep invalid environment values from disabling this guard.
+const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_FIRST_PROGRESS_TIMEOUT_MS = 60 * 60 * 1000;
+const MAX_SEMANTIC_PROGRESS_TIMEOUT_MS = 30 * 60 * 1000;
+
+function boundedDuration(name: string, fallback: number, maximum: number): number {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? Math.min(value, maximum) : fallback;
+}
+
+class CursorResponseStallTimeoutError extends Error {
+  constructor(stage: "first_progress" | "semantic_progress") {
+    super(`Cursor response stalled waiting for ${stage.replace("_", " ")}`);
+    this.name = "CursorResponseStallTimeoutError";
+  }
+}
+
+function createSemanticProgressWatchdog(
+  state: StreamState,
+  onStall: (error: CursorResponseStallTimeoutError) => void,
+): { observe: () => void; clear: () => void } {
+  const firstProgressTimeoutMs = boundedDuration(
+    "CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS",
+    DEFAULT_FIRST_PROGRESS_TIMEOUT_MS,
+    MAX_FIRST_PROGRESS_TIMEOUT_MS,
+  );
+  const semanticProgressTimeoutMs = boundedDuration(
+    "CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS",
+    DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_MS,
+    MAX_SEMANTIC_PROGRESS_TIMEOUT_MS,
+  );
+  let observedProgress = state.semanticProgressCount;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const arm = (timeoutMs: number, stage: "first_progress" | "semantic_progress") => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => onStall(new CursorResponseStallTimeoutError(stage)), timeoutMs);
+  };
+
+  arm(firstProgressTimeoutMs, "first_progress");
+  return {
+    observe() {
+      if (state.semanticProgressCount === observedProgress) return;
+      observedProgress = state.semanticProgressCount;
+      arm(semanticProgressTimeoutMs, "semantic_progress");
+    },
+    clear() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
 }
 
 function computeUsage(state: StreamState) {
@@ -1010,7 +1191,7 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
-function processServerMessage(
+export function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1020,51 +1201,107 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onProtocolError?: (error: Error) => void,
 ): void {
-  const msgCase = msg.message.case;
+  const markSemanticProgress = () => {
+    state.semanticProgressCount += 1;
+    state.lastSemanticProgressAt = Date.now();
+  };
 
-  if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText);
-  } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
-  } else if (msgCase === "execServerMessage") {
-    handleExecMessage(
-      msg.message.value as ExecServerMessage,
-      mcpTools,
-      cloudRule,
-      sendFrame,
-      onMcpExec,
-    );
-  } else if (msgCase === "conversationCheckpointUpdate") {
-    const stateStructure = msg.message.value as ConversationStateStructure;
-    if (stateStructure.tokenDetails) {
-      state.totalTokens = stateStructure.tokenDetails.usedTokens;
+  switch (msg.message.case) {
+    case "interactionUpdate":
+      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress);
+      return;
+    case "kvServerMessage":
+      handleKvMessage(msg.message.value, blobStore, sendFrame);
+      return;
+    case "execServerMessage":
+      markSemanticProgress();
+      handleExecMessage(msg.message.value, mcpTools, cloudRule, sendFrame, onMcpExec);
+      return;
+    case "conversationCheckpointUpdate": {
+      const stateStructure = msg.message.value;
+      if (stateStructure.tokenDetails) state.totalTokens = stateStructure.tokenDetails.usedTokens;
+      if (onCheckpoint) onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+      return;
     }
-    if (onCheckpoint) {
-      onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+    case "execServerControlMessage":
+      // Cursor's abort control has no OpenAI-compatible acknowledgement path.
+      // Failing is safer than leaving the server waiting for an unsupported response.
+      onProtocolError?.(new Error(`Unsupported Cursor exec control message: ${msg.message.value.message.case ?? "unknown"}`));
+      return;
+    case "interactionQuery":
+      // Query answers may require user interaction or Cursor-specific capabilities that
+      // this proxy cannot provide. Never silently leave the server waiting for one.
+      onProtocolError?.(new Error(`Unsupported Cursor interaction query: ${msg.message.value.query.case ?? "unknown"}`));
+      return;
+    case undefined:
+      // Protobuf decoders represent empty or forward-compatible messages as an
+      // unset oneof. They carry no semantic progress and must not turn a valid
+      // stream into a protocol error; structurally invalid payloads still throw
+      // during decoding and are terminated by the caller.
+      return;
+    default: {
+      const unhandled: never = msg.message;
+      throw new Error(`Unhandled Cursor server message: ${String(unhandled)}`);
     }
   }
 }
 
 function handleInteractionUpdate(
-  update: any,
+  update: InteractionUpdate,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  markSemanticProgress: () => void,
 ): void {
-  const updateCase = update.message?.case;
-
-  if (updateCase === "textDelta") {
-    const delta = update.message.value.text || "";
-    if (delta) onText(delta, false);
-  } else if (updateCase === "thinkingDelta") {
-    const delta = update.message.value.text || "";
-    if (delta) onText(delta, true);
-  } else if (updateCase === "tokenDelta") {
-    state.outputTokens += update.message.value.tokens ?? 0;
+  switch (update.message.case) {
+    case "textDelta": {
+      const delta = update.message.value.text || "";
+      if (delta) {
+        markSemanticProgress();
+        onText(delta, false);
+      }
+      return;
+    }
+    case "thinkingDelta": {
+      const delta = update.message.value.text || "";
+      if (delta) {
+        markSemanticProgress();
+        onText(delta, true);
+      }
+      return;
+    }
+    case "tokenDelta": {
+      const tokens = update.message.value.tokens ?? 0;
+      state.outputTokens += tokens;
+      if (tokens > 0) markSemanticProgress();
+      return;
+    }
+    // Tool calls are handled through execServerMessage, not InteractionUpdate.
+    case "partialToolCall":
+    case "toolCallDelta":
+    case "toolCallStarted":
+    case "toolCallCompleted":
+    // These update Cursor's internal transcript or UI but do not establish model progress.
+    case "thinkingCompleted":
+    case "userMessageAppended":
+    case "summary":
+    case "summaryStarted":
+    case "summaryCompleted":
+    case "shellOutputDelta":
+    case "stepStarted":
+    case "stepCompleted":
+    // Cursor's turnEnded sequencing is unproven, so only a Connect end-stream may terminate.
+    case "heartbeat":
+    case "turnEnded":
+      return;
+    case undefined:
+      return;
+    default: {
+      const unhandled: never = update.message;
+      throw new Error(`Unhandled Cursor interaction update: ${String(unhandled)}`);
+    }
   }
-  // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
-  // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1315,14 +1552,23 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
-    .digest("hex")
-    .slice(0, 16);
+function removeActiveBridge(active: ActiveBridge): void {
+  if (activeBridges.get(active.resumeId) === active) {
+    activeBridges.delete(active.resumeId);
+  }
+  for (const toolCallId of active.toolCallIds) {
+    if (activeBridgeToolCalls.get(toolCallId) === active.resumeId) {
+      activeBridgeToolCalls.delete(toolCallId);
+    }
+  }
+}
+
+function findPausedBridge(toolResults: ToolResultInfo[]): ActiveBridge | undefined {
+  if (toolResults.length === 0 || toolResults.some((result) => !result.toolCallId)) return undefined;
+  const resumeIds = new Set(toolResults.map((result) => activeBridgeToolCalls.get(result.toolCallId)));
+  if (resumeIds.size !== 1) return undefined;
+  const resumeId = resumeIds.values().next().value;
+  return typeof resumeId === "string" ? activeBridges.get(resumeId) : undefined;
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
@@ -1358,18 +1604,22 @@ function createBridgeStreamResponse(
   mcpTools: McpToolDefinition[],
   cloudRule: string | undefined,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  let cancelStream = () => {};
+  // `cancel()` is invoked outside the stream source's `start()` callback. Keep
+  // this state in the shared response owner so an aborted client prevents all
+  // later terminal or model-output writes to its already-cancelled controller.
+  let closed = false;
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
+        emitLifecycleDiagnostic("proxy", "sse_emission");
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       };
       const sendDone = () => {
@@ -1379,6 +1629,7 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        emitLifecycleDiagnostic("proxy", "terminal");
         controller.close();
       };
 
@@ -1410,13 +1661,53 @@ function createBridgeStreamResponse(
         pendingExecs: [],
         outputTokens: 0,
         totalTokens: 0,
+        semanticProgressCount: 0,
+        lastSemanticProgressAt: Date.now(),
       };
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let connectEndStreamReceived = false;
+      let terminal = false;
+      let semanticWatchdog: ReturnType<typeof createSemanticProgressWatchdog>;
+
+      const finishTerminal = (error?: Error) => {
+        if (terminal) return;
+        terminal = true;
+        semanticWatchdog.clear();
+        clearInterval(heartbeatTimer);
+        for (const active of activeBridges.values()) {
+          if (active.bridge === bridge) removeActiveBridge(active);
+        }
+
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        if (error) sendSSE(makeChunk({ content: `\n[Error: ${error.message}]` }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        bridge.terminate();
+      };
+
+      cancelStream = () => {
+        if (terminal) return;
+        terminal = true;
+        // The consumer owns the controller after cancellation. Do not call
+        // controller.close() or enqueue a terminal SSE frame here.
+        closed = true;
+        semanticWatchdog.clear();
+        clearInterval(heartbeatTimer);
+        for (const active of activeBridges.values()) {
+          if (active.bridge === bridge) removeActiveBridge(active);
+        }
+        bridge.terminate();
+      };
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
+          emitLifecycleDiagnostic("proxy", "connect_frame", { byteLength: messageBytes.length });
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -1427,7 +1718,9 @@ function createBridgeStreamResponse(
               blobStore,
               mcpTools,
               cloudRule,
-              (data) => bridge.write(data),
+              (data) => {
+                if (!bridge.write(data)) throw new Error("Failed to write frame to Cursor bridge");
+              },
               state,
               (text, isThinking) => {
                 if (isThinking) {
@@ -1440,6 +1733,10 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                // A tool pause transfers control to the caller; it is not a
+                // model-output stall and must leave its live bridge resumable.
+                semanticWatchdog.clear();
+                emitLifecycleDiagnostic("proxy", "tool_pause");
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -1460,15 +1757,27 @@ function createBridgeStreamResponse(
                   }],
                 }));
 
-                // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
+                // The server-issued tool-call ID identifies this paused
+                // interaction. Refuse a duplicate instead of overwriting an
+                // unrelated bridge and risking cross-conversation routing.
+                const existingResumeId = activeBridgeToolCalls.get(exec.toolCallId);
+                if (existingResumeId) {
+                  finishTerminal(new Error("Cursor tool-call identity is already paused"));
+                  return;
+                }
+                const resumeId = crypto.randomUUID();
+                const active: ActiveBridge = {
+                  resumeId,
+                  toolCallIds: new Set([exec.toolCallId]),
                   bridge,
                   heartbeatTimer,
                   blobStore,
                   mcpTools,
                   cloudRule,
                   pendingExecs: state.pendingExecs,
-                });
+                };
+                activeBridges.set(resumeId, active);
+                activeBridgeToolCalls.set(exec.toolCallId, resumeId);
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
@@ -1485,35 +1794,46 @@ function createBridgeStreamResponse(
                   persistConversation(convKey, stored);
                 }
               },
+              finishTerminal,
             );
-          } catch {
-            // Skip unparseable messages
+            semanticWatchdog.observe();
+            emitLifecycleDiagnostic("proxy", "message_dispatch", {
+              messageCase: serverMessage.message.case,
+              interactionCase: serverMessage.message.case === "interactionUpdate"
+                ? serverMessage.message.value.message?.case
+                : undefined,
+            });
+          } catch (error) {
+            // A complete Connect message frame that cannot decode as an
+            // AgentServerMessage cannot be safely skipped: it may be the only
+            // terminal signal. Unknown fields remain protobuf-compatible; this
+            // path is reserved for structurally invalid payloads and writes.
+            finishTerminal(error instanceof Error
+              ? new Error(`Failed to process Cursor server message: ${error.message}`)
+              : new Error("Failed to process Cursor server message"));
           }
         },
         (endStreamBytes) => {
+          connectEndStreamReceived = true;
           const endError = parseConnectEndStream(endStreamBytes);
+          emitLifecycleDiagnostic("proxy", "end_stream", {
+            byteLength: endStreamBytes.length,
+            status: endError ? "error" : "clean",
+          });
           if (process.env.CURSOR_PROXY_DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }
-          if (endError) {
-            // Surface the error and shut down: the server is done with this
-            // stream, and heartbeats would otherwise keep the bridge (and the
-            // SSE response) open forever.
-            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeController();
-            activeBridges.delete(bridgeKey);
-            clearInterval(heartbeatTimer);
-            bridge.end();
-          }
+          finishTerminal(endError ?? undefined);
         },
       );
+
+      semanticWatchdog = createSemanticProgressWatchdog(state, finishTerminal);
 
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        emitLifecycleDiagnostic("proxy", "terminal", { exitCode: code });
+        semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1521,26 +1841,31 @@ function createBridgeStreamResponse(
           stored.lastAccessMs = Date.now();
           persistConversation(convKey, stored);
         }
-        if (!mcpExecReceived) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
-          // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
-          activeBridges.delete(bridgeKey);
+        if (terminal) return;
+        if (mcpExecReceived) {
+          // Tool pause deliberately owns neither terminal cleanup nor bridge
+          // shutdown. Once the retained bridge itself exits, it is stale on
+          // either exit code and must no longer be resumable.
+          for (const active of activeBridges.values()) {
+            if (active.bridge === bridge) removeActiveBridge(active);
+          }
+          return;
         }
+
+        if (!connectEndStreamReceived) {
+          finishTerminal(new Error(
+            code === 0
+              ? "Connect stream ended without end-of-stream frame"
+              : `Bridge exited with code ${code} before Connect end-stream`,
+          ));
+          return;
+        }
+
+        finishTerminal(new Error(`Bridge exited with code ${code} after Connect end-stream`));
       });
+    },
+    cancel() {
+      cancelStream();
     },
   });
 
@@ -1555,6 +1880,7 @@ function startBridge(
   const bridge = spawnBridge({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
+    diagnostic: lifecycleDiagnosticContextInfo(),
   });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
@@ -1565,14 +1891,13 @@ function handleStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools, payload.cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, convKey,
   );
 }
 
@@ -1582,10 +1907,10 @@ function handleToolResultResume(
   toolResults: ToolResultInfo[],
   userText: string,
   modelId: string,
-  bridgeKey: string,
   convKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
+  emitLifecycleDiagnostic("proxy", "tool_resume", { toolCount: toolResults.length });
 
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
@@ -1652,11 +1977,17 @@ function handleToolResultResume(
     );
   }
 
-  return createBridgeStreamResponse(
+  try {
+    return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
-    modelId, bridgeKey, convKey,
-  );
+    modelId, convKey,
+    );
+  } catch (error) {
+    clearInterval(heartbeatTimer);
+    bridge.terminate();
+    throw error;
+  }
 }
 
 async function handleNonStreamingResponse(
@@ -1698,8 +2029,9 @@ async function collectFullResponse(
   accessToken: string,
   convKey: string,
 ): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
+  const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
+  let settled = false;
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
@@ -1708,8 +2040,36 @@ async function collectFullResponse(
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    semanticProgressCount: 0,
+    lastSemanticProgressAt: Date.now(),
   };
   const tagFilter = createThinkingTagFilter();
+
+  const persistState = () => {
+    const stored = conversationStates.get(convKey);
+    if (stored) {
+      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+      persistConversation(convKey, stored);
+    }
+  };
+  let semanticWatchdog: ReturnType<typeof createSemanticProgressWatchdog>;
+  const finishCollection = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    semanticWatchdog.clear();
+    clearInterval(heartbeatTimer);
+    persistState();
+    if (error) {
+      bridge.terminate();
+      reject(error);
+      return;
+    }
+    const flushed = tagFilter.flush();
+    fullText += flushed.content;
+    bridge.terminate();
+    resolve({ text: fullText, usage: computeUsage(state) });
+  };
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -1723,7 +2083,9 @@ async function collectFullResponse(
           payload.blobStore,
           payload.mcpTools,
           payload.cloudRule,
-          (data) => bridge.write(data),
+          (data) => {
+            if (!bridge.write(data)) throw new Error("Failed to write frame to Cursor bridge");
+          },
           state,
           (text, isThinking) => {
             if (isThinking) return;
@@ -1740,30 +2102,35 @@ async function collectFullResponse(
               persistConversation(convKey, stored);
             }
           },
+          (error) => {
+            finishCollection(error);
+          },
         );
-      } catch {
-        // Skip
+        semanticWatchdog.observe();
+      } catch (error) {
+        // A complete Connect frame with an invalid protobuf payload cannot be
+        // safely ignored in unary mode either: it may contain the only
+        // terminal signal. Preserve the same explicit protocol failure that
+        // the streaming path emits.
+        finishCollection(error instanceof Error
+          ? new Error(`Failed to process Cursor server message: ${error.message}`)
+          : new Error("Failed to process Cursor server message"));
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      const endError = parseConnectEndStream(endStreamBytes);
+      finishCollection(endError ?? undefined);
+    },
   ));
 
-  bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      persistConversation(convKey, stored);
-    }
-    const flushed = tagFilter.flush();
-    fullText += flushed.content;
+  semanticWatchdog = createSemanticProgressWatchdog(state, finishCollection);
 
-    const usage = computeUsage(state);
-    resolve({
-      text: fullText,
-      usage,
-    });
+  bridge.onClose((code) => {
+    finishCollection(new Error(
+      code === 0
+        ? "Connect stream ended without end-of-stream frame"
+        : `Bridge exited with code ${code} before Connect end-stream`,
+    ));
   });
 
   return promise;

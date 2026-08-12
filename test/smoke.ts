@@ -3,9 +3,24 @@ import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentServerMessageSchema,
+  ConversationStateStructureSchema,
+  ExecServerControlMessageSchema,
+  GetBlobArgsSchema,
   GetUsableModelsResponseSchema,
+  HeartbeatUpdateSchema,
+  InteractionQuerySchema,
+  InteractionUpdateSchema,
+  KvServerMessageSchema,
   ModelDetailsSchema,
+  TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
+import {
+  CURSOR_SCENARIOS,
+  createFakeCursorServer,
+  type CursorScenario,
+} from "./fixtures/fake-cursor-server";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -13,11 +28,13 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  getActiveBridgeCount: typeof import("../src/proxy").getActiveBridgeCount;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
+  processServerMessage: typeof import("../src/proxy").processServerMessage;
 }
 
 interface TestCursorBackend {
@@ -68,6 +85,23 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
+function frameConnectEndStream(payload: Uint8Array): Buffer {
+  const frame = frameConnectUnaryMessage(payload);
+  frame[0] = 0b00000010;
+  return frame;
+}
+
+async function captureDiagnosticOutput<T>(operation: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+  try {
+    return { result: await operation(), lines };
+  } finally {
+    console.error = original;
+  }
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -113,7 +147,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         ":status": 200,
         "content-type": "application/connect+proto",
       });
-      stream.end();
+      stream.end(Buffer.concat([
+        frameConnectUnaryMessage(new Uint8Array()),
+        frameConnectEndStream(new TextEncoder().encode("{}")),
+      ]));
       return;
     }
 
@@ -216,11 +253,13 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    getActiveBridgeCount: proxy.getActiveBridgeCount,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
+    processServerMessage: proxy.processServerMessage,
   };
 }
 
@@ -395,9 +434,653 @@ async function testArrayContentParsing(modules: TestModules) {
       );
     }
   }
+  assertEqual(res.status, 200, "Empty protobuf frames must be ignored without failing a non-streaming response");
 
   modules.stopProxy();
   console.log("[test] Array content parsing OK");
+}
+
+async function testNonStreamingProtocolErrorsAreStructured() {
+  console.log("[test] Testing non-streaming protocol error handling...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("malformed-server-message");
+  try {
+    const result = await runScenarioSubprocess(fixture.apiUrl, `
+      import { startProxy, stopProxy } from "./src/proxy.ts";
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "malformed non-streaming response" }] }),
+      });
+      const body = await response.json();
+      stopProxy();
+      console.log(JSON.stringify({ status: response.status, body }));
+      process.exit(0);
+    `);
+    assertEqual(result.status, 500, "Non-streaming protocol errors must return a structured server error");
+    const body = result.body as { error?: { message?: string } };
+    assert(
+      body.error?.message?.includes("Failed to process Cursor server message"),
+      "Non-streaming protocol errors must preserve the terminal error message",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Non-streaming protocol errors return structured responses");
+}
+
+async function runFakeScenario(apiUrl: string, scenario: CursorScenario): Promise<Buffer> {
+  const session = http2.connect(apiUrl);
+  const stream = session.request({
+    ":method": "POST",
+    ":path": "/agent.v1.AgentService/Run",
+    "x-fake-cursor-scenario": scenario,
+  });
+  const chunks: Buffer[] = [];
+  return new Promise<Buffer>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stream.close(http2.constants.NGHTTP2_CANCEL);
+      session.destroy();
+      reject(new Error(`Fixture scenario exceeded its deadline: ${scenario}`));
+    }, 500);
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      session.destroy();
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks));
+    };
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.once("end", () => finish());
+    stream.once("close", () => finish());
+    stream.once("error", () => finish());
+    stream.end();
+  });
+}
+
+async function testFakeCursorScenarioHarness() {
+  console.log("[test] Testing bounded fake Cursor scenario harness...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 100 });
+  try {
+    for (const scenario of CURSOR_SCENARIOS) {
+      fixture.setScenario(scenario);
+      await runFakeScenario(fixture.apiUrl, scenario);
+    }
+
+    fixture.trackChild(4242);
+    let caughtLeak = false;
+    try {
+      fixture.assertClean();
+    } catch (error) {
+      caughtLeak = error instanceof Error && error.message.includes("child process");
+    }
+    assert(caughtLeak, "Fixture cleanup assertion did not detect a deliberately leaked child");
+    fixture.untrackChild(4242);
+    fixture.trackBridgeEntry("deliberate-leak");
+    let caughtBridgeLeak = false;
+    try {
+      fixture.assertClean();
+    } catch (error) {
+      caughtBridgeLeak = error instanceof Error && error.message.includes("bridge map entry");
+    }
+    assert(caughtBridgeLeak, "Fixture cleanup assertion did not detect a deliberately leaked bridge entry");
+    fixture.untrackBridgeEntry("deliberate-leak");
+    await Bun.sleep(25);
+    fixture.assertClean();
+  } finally {
+    await fixture.close();
+  }
+  console.log(`[test] Fake Cursor scenarios selectable (${CURSOR_SCENARIOS.length}) and cleanup assertions OK`);
+}
+
+interface SseObservation {
+  body: string;
+  timedOut: boolean;
+}
+
+function doneCount(body: string): number {
+  return body.split("data: [DONE]").length - 1;
+}
+
+async function observeProxyScenario(
+  scenario: CursorScenario,
+  deadlineMs = 125,
+  environment: Record<string, string> = {},
+): Promise<SseObservation> {
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario(scenario);
+  const childScript = `
+    import { startProxy, stopProxy } from "./src/proxy.ts";
+    const port = await startProxy(async () => "test-token");
+    const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "reproduce termination behavior" }] }),
+    });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    const drain = (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return { body, timedOut: false };
+        body += decoder.decode(value, { stream: true });
+      }
+    })();
+    const result = await Promise.race([
+      drain,
+      new Promise((resolve) => setTimeout(() => resolve({ body, timedOut: true }), ${deadlineMs})),
+    ]);
+    void reader.cancel().catch(() => {});
+    stopProxy();
+    console.log(JSON.stringify(result));
+  `;
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", childScript],
+    cwd: process.cwd(),
+    env: { ...process.env, CURSOR_API_URL: fixture.apiUrl, ...environment },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    assertEqual(exitCode, 0, `Scenario subprocess failed (${scenario}): ${stderr}`);
+    return JSON.parse(stdout.trim()) as SseObservation;
+  } finally {
+    await fixture.close();
+  }
+}
+
+async function testStreamingTermination() {
+  console.log("[test] Testing streaming termination behavior...");
+
+  const cleanEnd = await observeProxyScenario("clean-end-stream-kept-open");
+  assert(!cleanEnd.timedOut && cleanEnd.body.includes("data: [DONE]"), "Clean end-stream must finish in the local H2 fixture");
+  assertEqual(doneCount(cleanEnd.body), 1, "Clean end-stream must emit exactly one [DONE]");
+  console.log("[test] Valid end-stream does not reproduce as an open SSE: bridge exit cascades to [DONE]");
+
+  const errorEnd = await observeProxyScenario("error-end-stream");
+  assert(errorEnd.body.includes("Connect error unavailable: fixture failure"), "Connect end-stream errors must preserve their code and message");
+  assertEqual(doneCount(errorEnd.body), 1, "Connect end-stream errors must emit exactly one [DONE]");
+  console.log("[test] Connect end-stream errors propagate exactly once");
+
+  const emptyEnd = await observeProxyScenario("empty-end-stream");
+  assert(!emptyEnd.timedOut, "Empty end-stream must terminate");
+  assert(!emptyEnd.body.includes("[Error:"), "Empty end-stream must not emit an error");
+  assertEqual(doneCount(emptyEnd.body), 1, "Empty end-stream must emit exactly one [DONE]");
+  console.log("[test] Empty end-stream completes cleanly exactly once");
+
+  const missingEnd = await observeProxyScenario("missing-end-stream");
+  assert(missingEnd.body.includes("[Error:"), "Missing end-stream must be surfaced as an error");
+  assertEqual(doneCount(missingEnd.body), 1, "Missing end-stream must emit exactly one [DONE]");
+  console.log("[test] Missing end-stream is an explicit error exactly once");
+
+  const bridgeExit = await observeProxyScenario("frame-error");
+  assert(bridgeExit.body.includes("[Error:"), "Bridge exit must be surfaced as an error");
+  assertEqual(doneCount(bridgeExit.body), 1, "Bridge exit must emit exactly one [DONE]");
+  console.log("[test] Bridge exit is an explicit error exactly once");
+
+  const malformedTerminal = await observeProxyScenario("malformed-terminal");
+  assert(malformedTerminal.body.includes("[Error:"), "Malformed terminal frame must be surfaced as an error");
+  assertEqual(doneCount(malformedTerminal.body), 1, "Malformed terminal frame must emit exactly one [DONE]");
+  console.log("[test] Malformed terminal frame is an explicit error exactly once");
+
+  const malformedMessage = await observeProxyScenario("malformed-server-message");
+  assert(malformedMessage.body.includes("Failed to process Cursor server message"), "Malformed protobuf payloads must reach the terminal error owner");
+  assertEqual(doneCount(malformedMessage.body), 1, "Malformed protobuf payloads must emit exactly one [DONE]");
+  console.log("[test] Malformed protobuf payloads terminate explicitly exactly once");
+
+  const abruptClose = await observeProxyScenario("abrupt-session-close");
+  assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
+  assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
+  console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+
+  const frameError = await observeProxyScenario("frame-error");
+  assert(frameError.body.includes("[Error:"), "HTTP/2 frame errors must be surfaced as an error");
+  assertEqual(doneCount(frameError.body), 1, "HTTP/2 frame errors must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 frame errors are explicit exactly once");
+
+  const goaway = await observeProxyScenario("goaway");
+  assert(goaway.body.includes("[Error:"), "HTTP/2 GOAWAY must be surfaced as an error");
+  assertEqual(doneCount(goaway.body), 1, "HTTP/2 GOAWAY must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 GOAWAY is explicit exactly once");
+
+  const aborted = await observeProxyScenario("stream-aborted");
+  assert(aborted.body.includes("[Error:"), "Aborted HTTP/2 streams must be surfaced as an error");
+  assertEqual(doneCount(aborted.body), 1, "Aborted HTTP/2 streams must emit exactly one [DONE]");
+  console.log("[test] Aborted HTTP/2 streams are explicit exactly once");
+
+  const sessionTimeout = await observeProxyScenario("silent-transport", 250, {
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(sessionTimeout.body.includes("[Error:"), "HTTP/2 session timeout must be surfaced as an error");
+  assertEqual(doneCount(sessionTimeout.body), 1, "HTTP/2 session timeout must emit exactly one [DONE]");
+  console.log("[test] HTTP/2 session timeout is explicit exactly once");
+
+  const heartbeatTrickle = await observeProxyScenario("heartbeat-trickle-kept-open", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+  });
+  assert(!heartbeatTrickle.timedOut, "Heartbeat-only traffic must be bounded by semantic progress, not fixture closure");
+  assert(heartbeatTrickle.body.includes("[Error: Cursor response stalled waiting for first progress]"), "Heartbeat-only traffic must reach an explicit semantic-stall error");
+  assertEqual(doneCount(heartbeatTrickle.body), 1, "Heartbeat-only semantic stalls must emit exactly one [DONE]");
+  console.log("[test] Heartbeat-only traffic is bounded by semantic progress exactly once");
+
+  const firstProgressStall = await observeProxyScenario("silent-transport", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!firstProgressStall.timedOut, "First-progress stalls must be bounded before transport liveness expires");
+  assert(firstProgressStall.body.includes("[Error: Cursor response stalled waiting for first progress]"), "First-progress stalls must surface an explicit error");
+  assertEqual(doneCount(firstProgressStall.body), 1, "First-progress stalls must emit exactly one [DONE]");
+  console.log("[test] First-progress stalls are bounded independently of transport liveness");
+
+  const turnEnded = await observeProxyScenario("turn-ended-kept-open");
+  assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
+  assertEqual(doneCount(turnEnded.body), 1, "turnEnded transport closure must emit exactly one [DONE]");
+  console.log("[test] turnEnded transport closure is an explicit error exactly once");
+
+  const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
+  assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");
+  assert(!slowProgress.body.includes("[Error:"), "Slow semantic progress must not emit an error");
+  for (const part of ["part-1", "part-2", "part-3"]) {
+    assert(slowProgress.body.includes(part), `Slow semantic progress lost ${part}`);
+  }
+  assert(slowProgress.body.includes("data: [DONE]"), "Slow semantic progress must finish normally");
+  console.log("[test] Slow semantic progress survives bounded streaming completion");
+
+  const semanticStall = await observeProxyScenario("semantic-progress-stall", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!semanticStall.timedOut, "Post-progress stalls must be bounded before the observation deadline");
+  assert(semanticStall.body.includes("[Error: Cursor response stalled waiting for semantic progress]"), "Post-progress stalls must use the between-progress bound, not the first-progress bound");
+  assertEqual(doneCount(semanticStall.body), 1, "Post-progress semantic stalls must emit exactly one [DONE]");
+  console.log("[test] Post-progress silence uses the semantic-progress stall bound");
+
+  const semanticTrickle = await observeProxyScenario("semantic-progress-trickle", 500, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+  });
+  assert(!semanticTrickle.timedOut, "Slow semantic progress must survive each re-armed between-progress bound");
+  assert(!semanticTrickle.body.includes("[Error:"), "Re-armed semantic progress must not emit a stall error");
+  assert(semanticTrickle.body.includes("trickle-4"), "Re-armed semantic progress must preserve the final delta");
+  assertEqual(doneCount(semanticTrickle.body), 1, "Re-armed semantic progress must emit exactly one [DONE]");
+  console.log("[test] Repeated semantic progress re-arms the between-progress bound");
+}
+
+async function testClientAbortTeardown() {
+  console.log("[test] Testing client-abort stream teardown...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("client-abort");
+  try {
+    const result = await runScenarioSubprocess(fixture.apiUrl, `
+      import { startProxy, stopProxy } from "./src/proxy.ts";
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "cancel this response" }] }),
+      });
+      const reader = response.body.getReader();
+      let text = "";
+      while (!text.includes("abort-ready")) {
+        const next = await reader.read();
+        if (next.done) break;
+        text += new TextDecoder().decode(next.value, { stream: true });
+      }
+      await reader.cancel();
+      await Bun.sleep(25);
+      stopProxy();
+      console.log(JSON.stringify({ received: text.includes("abort-ready") }));
+    `);
+    assertEqual(result.received, true, "Client-abort fixture must deliver output before cancellation");
+    fixture.assertClean();
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Client abort closes the controller path and tears down bridge resources");
+}
+
+async function testServerMessageClassification(modules: TestModules) {
+  console.log("[test] Testing server-message progress and unsupported-query classification...");
+  const state = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+    semanticProgressCount: 0,
+    lastSemanticProgressAt: 0,
+  };
+  const dispatch = (
+    message: Parameters<typeof create>[1],
+    onProtocolError?: (error: Error) => void,
+    sendFrame: (data: Uint8Array) => void = () => {},
+  ) =>
+    modules.processServerMessage(
+      create(AgentServerMessageSchema, message as never),
+      new Map(), [], undefined, sendFrame, state, () => {}, () => {}, undefined, onProtocolError,
+    );
+
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+  }) } });
+  dispatch({ message: { case: "conversationCheckpointUpdate", value: create(ConversationStateStructureSchema, {}) } });
+  assertEqual(state.semanticProgressCount, 0, "Heartbeat, turnEnded, and checkpoints must not count as semantic progress");
+
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "progress" }) },
+  }) } });
+  assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
+
+  let unsupportedError: Error | undefined;
+  dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
+    id: 1,
+    query: { case: "webSearchRequestQuery", value: {} },
+  }) } }, (error) => { unsupportedError = error; });
+  assert(unsupportedError?.message.includes("Unsupported Cursor interaction query"), "Unsupported blocking queries must trigger an explicit terminal error");
+  unsupportedError = undefined;
+  dispatch({ message: { case: "execServerControlMessage", value: create(ExecServerControlMessageSchema, {
+    message: { case: "abort", value: { id: 1 } },
+  }) } }, (error) => { unsupportedError = error; });
+  assert(unsupportedError?.message.includes("Unsupported Cursor exec control message"), "Unsupported control messages must trigger an explicit terminal error");
+
+  let writeFailure: Error | undefined;
+  try {
+    dispatch({ message: { case: "kvServerMessage", value: create(KvServerMessageSchema, {
+      id: 1,
+      message: { case: "getBlobArgs", value: create(GetBlobArgsSchema, { blobId: new Uint8Array([1]) }) },
+    }) } }, undefined, () => { throw new Error("bridge write rejected"); });
+  } catch (error) {
+    writeFailure = error instanceof Error ? error : new Error(String(error));
+  }
+  assertEqual(writeFailure?.message, "bridge write rejected", "Bridge write failures must propagate to the terminal owner");
+  const { sendNativeExecResult } = await import("../src/native-tools");
+  let nativeWriteFailure: Error | undefined;
+  try {
+    sendNativeExecResult(
+      { execId: "dead-bridge", execMsgId: 1 },
+      { resultType: "readResult", args: { path: "/tmp/never-written" } },
+      "unreachable",
+      () => false,
+    );
+  } catch (error) {
+    nativeWriteFailure = error instanceof Error ? error : new Error(String(error));
+  }
+  assertEqual(
+    nativeWriteFailure?.message,
+    "Failed to write native tool result to Cursor bridge",
+    "A dead bridge must explicitly reject native tool-result writes",
+  );
+  console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
+}
+
+async function runScenarioSubprocess(
+  apiUrl: string,
+  script: string,
+): Promise<Record<string, unknown>> {
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", script],
+    cwd: process.cwd(),
+    env: { ...process.env, CURSOR_API_URL: apiUrl },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  assertEqual(exitCode, 0, `Scenario subprocess failed: ${stderr}`);
+  return JSON.parse(stdout.trim()) as Record<string, unknown>;
+}
+
+async function observeToolResume(
+  apiUrl: string,
+  scenario: "tool-pause-resume" | "tool-pause-transport-death",
+  collision = false,
+): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess(apiUrl, `
+    import { startProxy, stopProxy } from "./src/proxy.ts";
+    const port = await startProxy(async () => "test-token");
+    const base = "http://localhost:" + port + "/v1/chat/completions";
+    const opening = "resume fixture collision-safe opening";
+    const request = (messages) => fetch(base, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", stream: true, messages, tools: [{ type: "function", function: { name: "fixture-tool", parameters: { type: "object" } } }] }),
+    });
+    const boundedText = async (response, deadlineMs = 150) => {
+      const reader = response.body.getReader(); let text = "";
+      const drain = (async () => { while (true) { const { done, value } = await reader.read(); if (done) return { text, timedOut: false }; text += new TextDecoder().decode(value, { stream: true }); } })();
+      const result = await Promise.race([drain, new Promise(resolve => setTimeout(() => resolve({ text, timedOut: true }), deadlineMs))]);
+      void reader.cancel().catch(() => {}); return result;
+    };
+    const first = await boundedText(await request([{ role: "user", content: opening }]));
+    const firstCall = JSON.parse(first.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
+    if ("${scenario}" === "tool-pause-transport-death") await Bun.sleep(30);
+    let second; let secondCall;
+    if (${collision}) {
+      second = await boundedText(await request([{ role: "user", content: opening }]));
+      secondCall = JSON.parse(second.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
+    }
+    const resumed = await boundedText(await request([
+      { role: "user", content: opening },
+      { role: "assistant", content: null, tool_calls: [{ id: firstCall, type: "function", function: { name: "fixture-tool", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: firstCall, content: "result-for-" + firstCall },
+    ]));
+    stopProxy();
+    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed }));
+    process.exit(0);
+  `);
+}
+
+async function observeStalledRefresh(): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess("http://127.0.0.1:1", `
+    import http from "node:http";
+    const server = http.createServer((_, res) => { void res; });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    process.env.CURSOR_REFRESH_URL = "http://127.0.0.1:" + port + "/auth/exchange_user_api_key";
+    process.env.CURSOR_REFRESH_TIMEOUT_MS = "25";
+    const { refreshCursorToken } = await import("./src/auth.ts");
+    const { startProxy, stopProxy } = await import("./src/proxy.ts");
+    const proxyPort = await startProxy(async () => (await refreshCursorToken("stalled-refresh")).access);
+    const pending = fetch("http://localhost:" + proxyPort + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: true, messages: [{ role: "user", content: "refresh stall" }] }) });
+    const result = await Promise.race([pending.then(async response => ({ headersReturned: true, status: response.status, body: await response.json() })), new Promise(resolve => setTimeout(() => resolve({ headersReturned: false }), 125))]);
+    stopProxy(); server.close(); console.log(JSON.stringify(result)); process.exit(0);
+  `);
+}
+
+async function observeSuccessfulRefresh(): Promise<Record<string, unknown>> {
+  return runScenarioSubprocess("http://127.0.0.1:1", `
+    import http from "node:http";
+    const server = http.createServer((req, res) => {
+      if (req.headers.authorization !== "Bearer valid-refresh") throw new Error("unexpected refresh authorization");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ accessToken: "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDAwMDAwMDB9.fakesig", refreshToken: "rotated-refresh" }));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    process.env.CURSOR_REFRESH_URL = "http://127.0.0.1:" + server.address().port + "/auth/exchange_user_api_key";
+    process.env.CURSOR_REFRESH_TIMEOUT_MS = "25";
+    const { refreshCursorToken } = await import("./src/auth.ts");
+    const refreshed = await refreshCursorToken("valid-refresh");
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    console.log(JSON.stringify({
+      accessMatches: refreshed.access === "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDAwMDAwMDB9.fakesig",
+      refreshMatches: refreshed.refresh === "rotated-refresh",
+    }));
+  `);
+}
+
+async function testResumeRefreshAndNonStreaming(modules: TestModules) {
+  console.log("[test] Testing resume, refresh, and collection behavior...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    fixture.setScenario("tool-pause-resume");
+    const liveResume = await observeToolResume(fixture.apiUrl, "tool-pause-resume");
+    assert(
+      String((liveResume.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "Healthy tool resume must preserve the matching tool result",
+    );
+    console.log("[test] Healthy tool resume preserves the paused bridge and result");
+
+    fixture.setScenario("tool-pause-transport-death");
+    const deadResume = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    assert(
+      String((deadResume.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
+      "A dead bridge must fall back to a new request instead of resuming the old stream",
+    );
+    console.log("[test] Transport death exits the child; resume follows the fresh-request fallback");
+
+    fixture.setScenario("tool-pause-resume");
+    const collision = await observeToolResume(fixture.apiUrl, "tool-pause-resume", true);
+    assert(
+      collision.secondCall !== undefined && collision.secondCall !== collision.firstCall,
+      "Identical-opening conversations must receive distinct paused tool-call identities",
+    );
+    assert(
+      String((collision.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "An identical-opening conversation must resume its own paused bridge",
+    );
+    assert(
+      !String((collision.resumed as { text?: string }).text ?? "").includes("resumed-with-wrong-result"),
+      "A tool result must never resume a different identical-opening conversation",
+    );
+    console.log("[test] Identical-opening conversations retain isolated paused bridges");
+
+    fixture.setScenario("tool-pause-transport-death");
+    const droppedWrite = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    assert(
+      String((droppedWrite.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
+      "A closed transport must not accept a dropped resume write as a live bridge",
+    );
+    assert(
+      !String((droppedWrite.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
+      "A dead bridge must reject its pending result rather than accepting a stale write",
+    );
+    console.log("[test] Closed-stream bridge rejects stale writes and resumes through a fresh request");
+
+    fixture.setScenario("tool-pause-clean-exit");
+    const port = await modules.startProxy(async () => "test-token");
+    const paused = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "test", stream: true,
+        messages: [{ role: "user", content: "paused bridge cleanup" }],
+        tools: [{ type: "function", function: { name: "fixture-tool", parameters: { type: "object" } } }],
+      }),
+    });
+    await paused.text();
+    await Bun.sleep(40);
+    assertEqual(modules.getActiveBridgeCount(), 0, "A clean terminal path must remove its paused bridge entry");
+    modules.stopProxy();
+    console.log("[test] Clean paused-bridge exit removes its active bridge entry");
+  } finally {
+    await fixture.close();
+  }
+
+  const refresh = await observeStalledRefresh();
+  assert(refresh.headersReturned === true, "Refresh stall must not leave the request pre-header");
+  assertEqual(refresh.status, 504, "Refresh timeout must return Gateway Timeout");
+  const refreshError = refresh.body as { error?: { message?: string; type?: string; code?: string } };
+  assertEqual(refreshError.error?.type, "gateway_timeout", "Refresh timeout must be a structured timeout error");
+  assertEqual(refreshError.error?.code, "token_refresh_timeout", "Refresh timeout must identify the refresh boundary");
+  assert(!JSON.stringify(refreshError).includes("stalled-refresh"), "Refresh timeout errors must not expose refresh credentials");
+  console.log("[test] Stalled token refresh returns a bounded, redacted structured error");
+
+  const successfulRefresh = await observeSuccessfulRefresh();
+  assertEqual(successfulRefresh.accessMatches, true, "Successful refresh must preserve the access token");
+  assertEqual(successfulRefresh.refreshMatches, true, "Successful refresh must preserve a rotated refresh token");
+  console.log("[test] Successful token refresh completes within the configured bound");
+
+  const collectionFixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    collectionFixture.setScenario("heartbeat-trickle-kept-open");
+    const nonStreaming = await runScenarioSubprocess(collectionFixture.apiUrl, `
+      process.env.CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS = "25";
+      process.env.CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS = "25";
+      const { startProxy, stopProxy } = await import("./src/proxy.ts");
+      const port = await startProxy(async () => "test-token");
+      const response = await fetch("http://localhost:" + port + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "non-streaming stall" }] }) });
+      const body = await response.json(); stopProxy(); console.log(JSON.stringify({ headersReturned: true, status: response.status, body })); process.exit(0);
+    `);
+    assert(nonStreaming.headersReturned === true, "Non-streaming collection must not wait forever for bridge close");
+    assertEqual(nonStreaming.status, 504, "Non-streaming semantic stalls must return Gateway Timeout");
+    const nonStreamingError = nonStreaming.body as { error?: { type?: string; code?: string } };
+    assertEqual(nonStreamingError.error?.type, "gateway_timeout", "Non-streaming stalls must be structured timeout errors");
+    assertEqual(nonStreamingError.error?.code, "response_stall_timeout", "Non-streaming stalls must identify the response boundary");
+    console.log("[test] Non-streaming collection returns a bounded structured stall error");
+  } finally {
+    await collectionFixture.close();
+  }
+}
+
+async function testLifecycleDiagnostics(modules: TestModules) {
+  console.log("[test] Testing redacted lifecycle diagnostics...");
+  const originalSetting = process.env.CURSOR_PROXY_DIAGNOSTICS;
+  const fakeToken = "fake-access-token-DO-NOT-LOG";
+  const secretPrompt = "prompt-content-DO-NOT-LOG";
+  const secretToolPayload = "tool-payload-DO-NOT-LOG";
+  const request = {
+    model: "test",
+    stream: true,
+    messages: [{ role: "user", content: secretPrompt }],
+    tools: [{
+      type: "function",
+      function: { name: "example", parameters: { type: "object", example: secretToolPayload } },
+    }],
+  };
+  const runRequest = async () => {
+    const port = await modules.startProxy(async () => fakeToken);
+    const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${fakeToken}` },
+      body: JSON.stringify(request),
+    });
+    await response.text();
+    await Bun.sleep(150);
+    modules.stopProxy();
+  };
+
+  try {
+    delete process.env.CURSOR_PROXY_DIAGNOSTICS;
+    const disabled = await captureDiagnosticOutput(runRequest);
+    assertEqual(disabled.lines.length, 0, "Diagnostics must be silent when disabled");
+
+    process.env.CURSOR_PROXY_DIAGNOSTICS = "1";
+    const enabled = await captureDiagnosticOutput(runRequest);
+    const events = enabled.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const stages = new Set(events.map((event) => event.stage));
+    for (const stage of [
+      "proxy_entry", "auth_access_start", "auth_access_complete", "bridge_spawn",
+      "bridge_start", "h2_connect", "connect_stream", "bridge_data", "connect_frame",
+      "message_dispatch", "sse_emission", "terminal",
+    ]) {
+      assert(stages.has(stage), `Missing diagnostic lifecycle stage: ${stage}`);
+    }
+    const requestIds = new Set(events.map((event) => event.requestId));
+    assertEqual(requestIds.size, 1, "Expected one shared diagnostic correlation ID");
+    assert(events.every((event) => typeof event.elapsedMs === "number"), "Expected monotonic diagnostic timing");
+    const output = enabled.lines.join("\n");
+    for (const secret of [fakeToken, secretPrompt, secretToolPayload]) {
+      assert(!output.includes(secret), `Diagnostic output leaked secret: ${secret}`);
+    }
+  } finally {
+    if (originalSetting === undefined) delete process.env.CURSOR_PROXY_DIAGNOSTICS;
+    else process.env.CURSOR_PROXY_DIAGNOSTICS = originalSetting;
+    modules.stopProxy();
+  }
+  console.log("[test] Redacted lifecycle diagnostics OK");
 }
 
 async function testExpiredTokenRefreshBeforeDiscovery(
@@ -531,20 +1214,36 @@ async function main() {
 
   const modules = await loadModules();
 
+  let unhandledRejection: unknown;
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejection = reason;
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+
   try {
     await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
+    await testNonStreamingProtocolErrorsAreStructured();
+    await testFakeCursorScenarioHarness();
+    await testStreamingTermination();
+    await testClientAbortTeardown();
+    await testServerMessageClassification(modules);
+    await testResumeRefreshAndNonStreaming(modules);
+    await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await Bun.sleep(0);
+    assert(!unhandledRejection, `Unhandled rejection escaped the smoke harness: ${String(unhandledRejection)}`);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
     console.error("\n✗ Smoke test failed:", err);
     process.exitCode = 1;
   } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
     modules.stopProxy();
     await backend.close();
   }
