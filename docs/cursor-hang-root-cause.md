@@ -39,6 +39,31 @@ recoverable and reviewable from that artifact. Nothing was silently discarded.
 > the file by design. Never reflow, reformat, or strip trailing whitespace from this artifact —
 > doing so corrupts the evidence and breaks `git apply` fidelity.
 
+## Baseline status at inherited tip
+
+Wave 1 Task 1.1 re-verified the inherited stability floor at tip
+`1ffca147b461ea044e041626eb1ccc7465169526` (`1ffca14`) on
+`chore/stability-baseline`. The repository gates completed as follows:
+
+| Check | Result |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | PASS — no errors |
+| `bun test/smoke.ts` | PASS — 48 required assertions passed; 2 documented quarantines remain |
+| `bun run build` | PASS |
+| `git diff --check` | PASS for edited documentation; `overlay-baseline.patch` remains a verbatim evidence artifact and is not reformatted |
+
+The smoke suite writes cache data under `~/.cache/opencode-cursor` and uses a
+local fake Cursor backend; it does not contact Cursor. This record accepts the
+inherited tip as the baseline floor before new stability behavior is changed.
+
+The overlay artifact is preserved evidence and **MUST NOT be reapplied**. Its
+three-way disposition is: **kept/already landed** — stderr draining, sanitized
+errors, defensive close/destroy guards; **rejected** — fixed 30→60s connect and
+120→180s idle timeout bumps; **replaced** — the 90s raw-byte watchdog,
+superseded by semantic-progress plus H2 liveness. See the adjacent
+[`overlay-baseline.note.md`](./overlay-baseline.note.md); the patch itself was
+not modified.
+
 ## Hunk inventory and disposition
 
 | # | File | Location | Change | Apparent intent | Hang mechanism affected | Verdict |
