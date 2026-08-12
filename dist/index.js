@@ -139,7 +139,22 @@ export const CursorAuthPlugin = async (input) => {
                         throw new Error("Cursor auth not configured");
                     return token;
                 }, models);
-                return buildCursorProviderModels(models, port);
+                const built = buildCursorProviderModels(models, port);
+                // Preserve any model IDs already present on the provider (config stubs).
+                for (const id of Object.keys(_provider.models ?? {})) {
+                    if (!built[id]) {
+                        built[id] = buildCursorProviderModels([
+                            {
+                                id,
+                                name: id,
+                                reasoning: true,
+                                contextWindow: 200_000,
+                                maxTokens: 64_000,
+                            },
+                        ], port)[id];
+                    }
+                }
+                return built;
             },
         },
         auth: {
@@ -185,10 +200,29 @@ export const CursorAuthPlugin = async (input) => {
                     return currentAuth.access;
                 }, models);
                 if (provider) {
-                    provider.models = buildCursorProviderModels(models, port);
+                    const existing = (provider.models ?? {});
+                    const built = buildCursorProviderModels(models, port);
+                    // Keep user-configured model IDs (e.g. whitelist-only stubs) and
+                    // give them the same proxy api.url as discovered models.
+                    for (const [id, model] of Object.entries(existing)) {
+                        if (!built[id]) {
+                            built[id] = {
+                                ...buildCursorProviderModels([
+                                    {
+                                        id,
+                                        name: model.name ?? id,
+                                        reasoning: true,
+                                        contextWindow: 200_000,
+                                        maxTokens: 64_000,
+                                    },
+                                ], port)[id],
+                            };
+                        }
+                    }
+                    provider.models = built;
                 }
                 return {
-                    baseURL: `http://localhost:${port}/v1`,
+                    baseURL: `http://127.0.0.1:${port}/v1`,
                     apiKey: "cursor-proxy",
                     async fetch(requestInput, init) {
                         if (init?.headers) {
@@ -241,7 +275,7 @@ function buildCursorProviderModels(models, port) {
             providerID: CURSOR_PROVIDER_ID,
             api: {
                 id: model.id,
-                url: `http://localhost:${port}/v1`,
+                url: `http://127.0.0.1:${port}/v1`,
                 npm: "@ai-sdk/openai-compatible",
             },
             name: model.name,
