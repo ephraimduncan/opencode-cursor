@@ -130,18 +130,6 @@ function frameConnectMessage(data, flags = 0) {
     return frame;
 }
 function spawnBridge(options) {
-    // Use process.execPath so the bridge runs under the same runtime that loads
-    // this plugin: Bun on the CLI, Node in the Desktop sidecar. Both can run .mjs.
-    const proc = spawnProcess(process.execPath, [BRIDGE_PATH], {
-        stdio: ["pipe", "pipe", "ignore"],
-    });
-    const config = JSON.stringify({
-        accessToken: options.accessToken,
-        url: options.url ?? CURSOR_API_URL,
-        path: options.rpcPath,
-        unary: options.unary ?? false,
-    });
-    proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
     const cbs = {
         data: null,
         close: null,
@@ -149,6 +137,83 @@ function spawnBridge(options) {
     // Track exit state so late onClose registrations fire immediately.
     let exited = false;
     let exitCode = 1;
+    const config = JSON.stringify({
+        accessToken: options.accessToken,
+        url: options.url ?? CURSOR_API_URL,
+        path: options.rpcPath,
+        unary: options.unary ?? false,
+    });
+    const configBytes = lpEncode(new TextEncoder().encode(config));
+    // Prefer Bun.spawn on the CLI (original path). Fall back to node:child_process
+    // on the Desktop Node sidecar. The bridge binary is always `node` because
+    // Bun's node:http2 is broken (see file header).
+    const bunSpawn = globalThis.Bun?.spawn;
+    if (bunSpawn) {
+        const proc = bunSpawn(["node", BRIDGE_PATH], {
+            stdin: "pipe",
+            stdout: "pipe",
+            stderr: "ignore",
+        });
+        proc.stdin.write(configBytes);
+        (async () => {
+            const reader = proc.stdout.getReader();
+            let pending = Buffer.alloc(0);
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done)
+                        break;
+                    pending = Buffer.concat([pending, Buffer.from(value)]);
+                    while (pending.length >= 4) {
+                        const len = pending.readUInt32BE(0);
+                        if (pending.length < 4 + len)
+                            break;
+                        const payload = pending.subarray(4, 4 + len);
+                        pending = pending.subarray(4 + len);
+                        cbs.data?.(Buffer.from(payload));
+                    }
+                }
+            }
+            catch {
+                // Stream ended
+            }
+            const code = (await proc.exited) ?? 1;
+            exited = true;
+            exitCode = code;
+            cbs.close?.(code);
+        })();
+        return {
+            proc: { kill: () => { try {
+                    proc.kill();
+                }
+                catch { } } },
+            get alive() { return !exited; },
+            write(data) {
+                try {
+                    proc.stdin.write(lpEncode(data));
+                }
+                catch { }
+            },
+            end() {
+                try {
+                    proc.stdin.write(lpEncode(new Uint8Array(0)));
+                    proc.stdin.end();
+                }
+                catch { }
+            },
+            onData(cb) { cbs.data = cb; },
+            onClose(cb) {
+                if (exited)
+                    queueMicrotask(() => cb(exitCode));
+                else
+                    cbs.close = cb;
+            },
+        };
+    }
+    const proc = spawnProcess("node", [BRIDGE_PATH], {
+        stdio: ["pipe", "pipe", "ignore"],
+    });
+    proc.stdin.write(configBytes);
     const exitedPromise = new Promise((resolve) => {
         proc.once("exit", (code) => resolve(code ?? 1));
         proc.once("error", () => resolve(1));
@@ -177,7 +242,10 @@ function spawnBridge(options) {
         cbs.close?.(code);
     })();
     return {
-        proc,
+        proc: { kill: () => { try {
+                proc.kill();
+            }
+            catch { } } },
         get alive() { return !exited; },
         write(data) {
             try {
@@ -194,13 +262,10 @@ function spawnBridge(options) {
         },
         onData(cb) { cbs.data = cb; },
         onClose(cb) {
-            if (exited) {
-                // Process already exited — invoke immediately so streams don't hang.
+            if (exited)
                 queueMicrotask(() => cb(exitCode));
-            }
-            else {
+            else
                 cbs.close = cb;
-            }
         },
     };
 }
@@ -253,51 +318,104 @@ function buildOpenAIModelList(models) {
         owned_by: "cursor",
     }));
 }
-/**
- * Bridge between node:http and the fetch-style handler below so the request
- * handling logic is identical on Bun (CLI) and Node (Desktop sidecar).
- */
-async function handleProxyRequest(req, res) {
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    try {
-        if (req.method === "GET" && url.pathname === "/v1/models") {
-            await sendResponse(res, new Response(JSON.stringify({
-                object: "list",
-                data: buildOpenAIModelList(proxyModels),
-            }), { headers: { "Content-Type": "application/json" } }));
-            return;
-        }
-        if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-            const chunks = [];
-            for await (const chunk of req)
-                chunks.push(Buffer.from(chunk));
-            const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+async function handleFetchRequest(req) {
+    const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname === "/v1/models") {
+        return new Response(JSON.stringify({
+            object: "list",
+            data: buildOpenAIModelList(proxyModels),
+        }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        try {
+            const body = (await req.json());
             if (!proxyAccessTokenProvider) {
                 throw new Error("Cursor proxy access token provider not configured");
             }
             const accessToken = await proxyAccessTokenProvider();
-            await sendResponse(res, await handleChatCompletion(body, accessToken));
-            return;
+            return handleChatCompletion(body, accessToken);
         }
-        await sendResponse(res, new Response("Not Found", { status: 404 }));
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return new Response(JSON.stringify({
+                error: { message, type: "server_error", code: "internal_error" },
+            }), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        await sendResponse(res, new Response(JSON.stringify({
-            error: { message, type: "server_error", code: "internal_error" },
-        }), { status: 500, headers: { "Content-Type": "application/json" } }));
-    }
+    return new Response("Not Found", { status: 404 });
 }
-async function sendResponse(res, rs) {
-    res.writeHead(rs.status, Object.fromEntries(rs.headers.entries()));
-    if (rs.body) {
-        const stream = Readable.fromWeb(rs.body);
+/**
+ * Bridge between node:http and the fetch-style handler so Desktop's Node
+ * sidecar can host the proxy without Bun.serve.
+ */
+async function handleProxyRequest(req, res) {
+    const host = req.headers.host ?? "127.0.0.1";
+    const url = new URL(req.url ?? "/", `http://${host}`);
+    const chunks = [];
+    for await (const chunk of req)
+        chunks.push(Buffer.from(chunk));
+    const request = new Request(url, {
+        method: req.method,
+        headers: req.headers,
+        body: chunks.length > 0 ? Buffer.concat(chunks) : undefined,
+    });
+    const response = await handleFetchRequest(request);
+    res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+    if (response.body) {
+        const stream = Readable.fromWeb(response.body);
         stream.on("error", () => res.destroy());
         stream.pipe(res);
     }
     else {
         res.end();
     }
+}
+function startNodeHttpProxy() {
+    const server = createServer((req, res) => {
+        handleProxyRequest(req, res).catch(() => {
+            if (!res.headersSent)
+                res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "internal_error", type: "server_error" } }));
+        });
+    });
+    server.keepAliveTimeout = 255_000;
+    return new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            if (!address || typeof address === "string") {
+                reject(new Error("Failed to bind proxy to a port"));
+                return;
+            }
+            resolve({
+                port: address.port,
+                stop: () => {
+                    server.close();
+                },
+            });
+        });
+    });
+}
+function startBunProxy() {
+    // Prefer Bun.serve on the CLI — it is the original, battle-tested path.
+    const bunServe = globalThis.Bun?.serve;
+    if (!bunServe) {
+        throw new Error("Bun.serve is not available");
+    }
+    const server = bunServe({
+        port: 0,
+        hostname: "127.0.0.1",
+        idleTimeout: 255,
+        fetch: handleFetchRequest,
+    });
+    if (!server.port)
+        throw new Error("Failed to bind proxy to a port");
+    return {
+        port: server.port,
+        stop: () => {
+            server.stop();
+        },
+    };
 }
 export function getProxyPort() {
     return proxyPort;
@@ -311,28 +429,17 @@ export async function startProxy(getAccessToken, models = []) {
     if (proxyServer && proxyPort)
         return proxyPort;
     pruneStaleConversationFiles();
-    proxyServer = createServer((req, res) => {
-        handleProxyRequest(req, res).catch(() => {
-            if (!res.headersSent)
-                res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: { message: "internal_error", type: "server_error" } }));
-        });
-    });
-    proxyServer.keepAliveTimeout = 255_000; // max — Cursor responses can take 30s+
-    await new Promise((resolve, reject) => {
-        proxyServer.once("error", reject);
-        proxyServer.listen(0, "127.0.0.1", () => resolve());
-    });
-    const address = proxyServer.address();
-    if (!address || typeof address === "string") {
-        throw new Error("Failed to bind proxy to a port");
-    }
-    proxyPort = address.port;
+    // Bun CLI → Bun.serve; Node Desktop sidecar → node:http.
+    proxyServer =
+        typeof globalThis.Bun !== "undefined"
+            ? startBunProxy()
+            : await startNodeHttpProxy();
+    proxyPort = proxyServer.port;
     return proxyPort;
 }
 export function stopProxy() {
     if (proxyServer) {
-        proxyServer.close();
+        proxyServer.stop();
         proxyServer = undefined;
         proxyPort = undefined;
         proxyAccessTokenProvider = undefined;
