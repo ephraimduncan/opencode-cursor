@@ -1,4 +1,4 @@
-import { generatePKCE } from "./pkce";
+import { generatePKCE } from "./pkce.js";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
@@ -48,7 +48,7 @@ export async function pollCursorAuth(
   let consecutiveErrors = 0;
 
   for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
-    await Bun.sleep(delay);
+    await new Promise((resolve) => setTimeout(resolve, delay));
 
     try {
       const response = await fetch(

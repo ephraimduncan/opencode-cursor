@@ -15,9 +15,9 @@ import {
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
-} from "./auth";
-import { getCursorModels, type CursorModel } from "./models";
-import { startProxy } from "./proxy";
+} from "./auth.js";
+import { getCursorModels, type CursorModel } from "./models.js";
+import { startProxy } from "./proxy.js";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -181,7 +181,25 @@ export const CursorAuthPlugin: Plugin = async (
           if (!token) throw new Error("Cursor auth not configured");
           return token;
         }, models);
-        return buildCursorProviderModels(models, port);
+        const built = buildCursorProviderModels(models, port);
+        // Preserve any model IDs already present on the provider (config stubs).
+        for (const id of Object.keys(_provider.models ?? {})) {
+          if (!built[id]) {
+            built[id] = buildCursorProviderModels(
+              [
+                {
+                  id,
+                  name: id,
+                  reasoning: true,
+                  contextWindow: 200_000,
+                  maxTokens: 64_000,
+                },
+              ],
+              port,
+            )[id]!;
+          }
+        }
+        return built;
       },
     },
 
@@ -234,11 +252,33 @@ export const CursorAuthPlugin: Plugin = async (
         }, models);
 
         if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
+          const existing = ((provider as any).models ?? {}) as CatalogModels;
+          const built = buildCursorProviderModels(models, port);
+          // Keep user-configured model IDs (e.g. whitelist-only stubs) and
+          // give them the same proxy api.url as discovered models.
+          for (const [id, model] of Object.entries(existing)) {
+            if (!built[id]) {
+              built[id] = {
+                ...buildCursorProviderModels(
+                  [
+                    {
+                      id,
+                      name: (model as { name?: string }).name ?? id,
+                      reasoning: true,
+                      contextWindow: 200_000,
+                      maxTokens: 64_000,
+                    },
+                  ],
+                  port,
+                )[id]!,
+              };
+            }
+          }
+          (provider as any).models = built;
         }
 
         return {
-          baseURL: `http://localhost:${port}/v1`,
+          baseURL: `http://127.0.0.1:${port}/v1`,
           apiKey: "cursor-proxy",
           async fetch(
             requestInput: RequestInfo | URL,
@@ -312,7 +352,7 @@ function buildCursorProviderModels(
         providerID: CURSOR_PROVIDER_ID,
         api: {
           id: model.id,
-          url: `http://localhost:${port}/v1`,
+          url: `http://127.0.0.1:${port}/v1`,
           npm: "@ai-sdk/openai-compatible",
         },
         name: model.name,
@@ -448,4 +488,14 @@ function estimateModelCost(modelId: string): ModelCost {
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 
-export default CursorAuthPlugin;
+/**
+ * Modern plugin module format: `{ id, server }`. Newer opencode loaders
+ * (including the Desktop app's sidecar) require this shape; the bare
+ * function default export was silently ignored there.
+ */
+export const CursorAuthPluginModule = {
+  id: "opencode-cursor-oauth",
+  server: CursorAuthPlugin,
+};
+
+export default CursorAuthPluginModule;
