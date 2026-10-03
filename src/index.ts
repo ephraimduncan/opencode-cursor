@@ -166,7 +166,7 @@ export const CursorAuthPlugin: Plugin = async (
       id: CURSOR_PROVIDER_ID,
       async models(_provider, ctx) {
         const auth = ctx.auth;
-        if (!auth || auth.type !== "oauth") return {};
+        if (!auth || auth.type !== "oauth") return {} as any;
 
         let accessToken = auth.access;
         if (!accessToken || auth.expires < Date.now()) {
@@ -249,7 +249,7 @@ export const CursorAuthPlugin: Plugin = async (
                 init.headers.delete("authorization");
               } else if (Array.isArray(init.headers)) {
                 init.headers = init.headers.filter(
-                  ([key]) => key.toLowerCase() !== "authorization",
+                  ([key]) => (key || "").toLowerCase() !== "authorization",
                 );
               } else {
                 delete (init.headers as Record<string, string>)[
@@ -367,14 +367,23 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "claude-4.5-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
   "claude-4.5-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
   "claude-4.6-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
-  "claude-4.6-opus-fast":    { input: 30, output: 150, cache: { read: 3, write: 37.5 } },
   "claude-4.6-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+  "claude-opus-4-8":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+  "claude-opus-4-8-fast":    { input: 30, output: 150, cache: { read: 3, write: 37.5 } },
+  "claude-opus-5":           { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+  "claude-opus-5.5":         { input: 4, output: 20, cache: { read: 0.2, write: 5 } },
+  "claude-sonnet-5":         { input: 2, output: 10, cache: { read: 0.2, write: 2.5 } },
+  "claude-fable-5":          { input: 10, output: 50, cache: { read: 1, write: 12.5 } },
+  "claude-fable-5.1":        { input: 10, output: 50, cache: { read: 0.25, write: 12.5 } },
 
-  // Cursor
+  // Cursor (first-party)
   "composer-1":              { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "composer-1.5":            { input: 3.5, output: 17.5, cache: { read: 0.35, write: 0 } },
   "composer-2":              { input: 0.5, output: 2.5, cache: { read: 0.2, write: 0 } },
   "composer-2-fast":         { input: 1.5, output: 7.5, cache: { read: 0.2, write: 0 } },
+  "composer-2.5":            { input: 0.5, output: 2.5, cache: { read: 0.2, write: 0 } },
+  "composer-2.5-fast":       { input: 3, output: 15, cache: { read: 0.5, write: 0 } },
+  "grok-4.7-fast":           { input: 4, output: 12, cache: { read: 1, write: 0 } },
 
   // Google
   "gemini-2.5-flash":        { input: 0.3, output: 2.5, cache: { read: 0.03, write: 0 } },
@@ -382,6 +391,10 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gemini-3-pro":            { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
   "gemini-3-pro-image":      { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
   "gemini-3.1-pro":          { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
+  "gemini-3.5-flash":        { input: 1.5, output: 9, cache: { read: 0.15, write: 0 } },
+  "gemini-3.6-flash":        { input: 1.5, output: 7.5, cache: { read: 0.15, write: 0 } },
+  "gemini-3.7-flash":        { input: 0.75, output: 3.5, cache: { read: 0.075, write: 0 } },
+  "gemini-3.8-flash":        { input: 0.75, output: 3.5, cache: { read: 0.075, write: 0 } },
 
   // OpenAI
   "gpt-5":                   { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
@@ -397,41 +410,77 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.4":                 { input: 2.5, output: 15, cache: { read: 0.25, write: 0 } },
   "gpt-5.4-mini":            { input: 0.75, output: 4.5, cache: { read: 0.075, write: 0 } },
   "gpt-5.4-nano":            { input: 0.2, output: 1.25, cache: { read: 0.02, write: 0 } },
+  "gpt-5.5":                 { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
+  "gpt-5.6-luna":            { input: 0.2, output: 1.2, cache: { read: 0.02, write: 0.25 } },
+  "gpt-5.6-sol":             { input: 4, output: 20, cache: { read: 0.4, write: 5 } },
+  "gpt-5.6-terra":           { input: 2, output: 12, cache: { read: 0.2, write: 2.5 } },
+
+  // Z.ai
+  "glm-5.2":                 { input: 1.4, output: 4.4, cache: { read: 0.26, write: 0 } },
 
   // xAI
   "grok-4.20":               { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
 
   // Moonshot
   "kimi-k2.5":               { input: 0.6, output: 3, cache: { read: 0.1, write: 0 } },
+  "kimi-k2.7-code":          { input: 0.95, output: 4, cache: { read: 0.19, write: 0 } },
+  "kimi-k3":                 { input: 3, output: 15, cache: { read: 0.3, write: 0 } },
+
+  // Meta
+  "muse-spark-1.3":          { input: 1.25, output: 4.25, cache: { read: 0.15, write: 0 } },
 };
 
 // Most-specific first
 const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCost }> = [
-  { match: (id) => /claude.*opus.*fast/i.test(id),   cost: MODEL_COST_TABLE["claude-4.6-opus-fast"]! },
-  { match: (id) => /claude.*opus/i.test(id),         cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
-  { match: (id) => /claude.*haiku/i.test(id),        cost: MODEL_COST_TABLE["claude-4.5-haiku"]! },
-  { match: (id) => /claude.*sonnet/i.test(id),       cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
-  { match: (id) => /claude/i.test(id),               cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
-  { match: (id) => /composer-?2/i.test(id),          cost: MODEL_COST_TABLE["composer-2"]! },
-  { match: (id) => /composer-?1\.5/i.test(id),      cost: MODEL_COST_TABLE["composer-1.5"]! },
-  { match: (id) => /composer/i.test(id),             cost: MODEL_COST_TABLE["composer-1"]! },
-  { match: (id) => /gpt-5\.4.*nano/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-nano"]! },
-  { match: (id) => /gpt-5\.4.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
-  { match: (id) => /gpt-5\.4/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.4"]! },
-  { match: (id) => /gpt-5\.3/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.3-codex"]! },
-  { match: (id) => /gpt-5\.2/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.2"]! },
-  { match: (id) => /gpt-5\.1.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.1-codex-mini"]! },
-  { match: (id) => /gpt-5\.1/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.1-codex"]! },
-  { match: (id) => /gpt-5.*mini/i.test(id),          cost: MODEL_COST_TABLE["gpt-5-mini"]! },
-  { match: (id) => /gpt-5.*fast/i.test(id),          cost: MODEL_COST_TABLE["gpt-5-fast"]! },
-  { match: (id) => /gpt-5/i.test(id),                cost: MODEL_COST_TABLE["gpt-5"]! },
-  { match: (id) => /gemini.*3\.1/i.test(id),        cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
+  { match: (id) => /claude.*opus.*fast/i.test(id),   cost: MODEL_COST_TABLE["claude-opus-4-8-fast"]! },
+  { match: (id) => /claude.*opus.*4-8/i.test(id),     cost: MODEL_COST_TABLE["claude-opus-4-8"]! },
+  { match: (id) => /claude.*opus.*5.5/i.test(id),     cost: MODEL_COST_TABLE["claude-opus-5.5"]! },
+  { match: (id) => /claude.*opus-5/i.test(id),       cost: MODEL_COST_TABLE["claude-opus-5"]! },
+  { match: (id) => /claude.*opus.*4-6/i.test(id),     cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
+  { match: (id) => /claude.*opus/i.test(id),           cost: MODEL_COST_TABLE["claude-4.6-opus"]! },
+  { match: (id) => /claude.*sonnet.*5/i.test(id),     cost: MODEL_COST_TABLE["claude-sonnet-5"]! },
+  { match: (id) => /claude.*fable.*5\.1/i.test(id),   cost: MODEL_COST_TABLE["claude-fable-5.1"]! },
+  { match: (id) => /claude.*fable/i.test(id),         cost: MODEL_COST_TABLE["claude-fable-5"]! },
+  { match: (id) => /claude.*sonnet/i.test(id),        cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
+  { match: (id) => /claude.*haiku/i.test(id),         cost: MODEL_COST_TABLE["claude-4.5-haiku"]! },
+  { match: (id) => /claude/i.test(id),                 cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
+  { match: (id) => /composer-?2\.5-fast/i.test(id),   cost: MODEL_COST_TABLE["composer-2.5-fast"]! },
+  { match: (id) => /composer-?2\.5/i.test(id),        cost: MODEL_COST_TABLE["composer-2.5"]! },
+  { match: (id) => /composer-?2-fast/i.test(id),      cost: MODEL_COST_TABLE["composer-2-fast"]! },
+  { match: (id) => /composer-?2/i.test(id),           cost: MODEL_COST_TABLE["composer-2"]! },
+  { match: (id) => /composer-?1\.5/i.test(id),        cost: MODEL_COST_TABLE["composer-1.5"]! },
+  { match: (id) => /composer/i.test(id),              cost: MODEL_COST_TABLE["composer-1"]! },
+  { match: (id) => /gpt-5\.6.*luna/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.6-luna"]! },
+  { match: (id) => /gpt-5\.6.*sol/i.test(id),        cost: MODEL_COST_TABLE["gpt-5.6-sol"]! },
+  { match: (id) => /gpt-5\.6.*terra/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.6-terra"]! },
+  { match: (id) => /gpt-5\.4.*nano/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.4-nano"]! },
+  { match: (id) => /gpt-5\.4.*mini/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
+  { match: (id) => /gpt-5\.4/i.test(id),              cost: MODEL_COST_TABLE["gpt-5.4"]! },
+  { match: (id) => /gpt-5\.5/i.test(id),              cost: MODEL_COST_TABLE["gpt-5.5"]! },
+  { match: (id) => /gpt-5\.3/i.test(id),              cost: MODEL_COST_TABLE["gpt-5.3-codex"]! },
+  { match: (id) => /gpt-5\.2/i.test(id),              cost: MODEL_COST_TABLE["gpt-5.2"]! },
+  { match: (id) => /gpt-5\.1.*mini/i.test(id),       cost: MODEL_COST_TABLE["gpt-5.1-codex-mini"]! },
+  { match: (id) => /gpt-5\.1/i.test(id),              cost: MODEL_COST_TABLE["gpt-5.1-codex"]! },
+  { match: (id) => /gpt-5.*mini/i.test(id),           cost: MODEL_COST_TABLE["gpt-5-mini"]! },
+  { match: (id) => /gpt-5.*fast/i.test(id),           cost: MODEL_COST_TABLE["gpt-5-fast"]! },
+  { match: (id) => /gpt-5/i.test(id),                 cost: MODEL_COST_TABLE["gpt-5"]! },
+  { match: (id) => /gemini.*3\.1/i.test(id),          cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
+  { match: (id) => /gemini.*3\.8/i.test(id),          cost: MODEL_COST_TABLE["gemini-3.8-flash"]! },
+  { match: (id) => /gemini.*3\.7/i.test(id),          cost: MODEL_COST_TABLE["gemini-3.7-flash"]! },
+  { match: (id) => /gemini.*3\.6/i.test(id),          cost: MODEL_COST_TABLE["gemini-3.6-flash"]! },
+  { match: (id) => /gemini.*3\.5/i.test(id),          cost: MODEL_COST_TABLE["gemini-3.5-flash"]! },
   { match: (id) => /gemini.*3.*flash/i.test(id),     cost: MODEL_COST_TABLE["gemini-3-flash"]! },
-  { match: (id) => /gemini.*3/i.test(id),            cost: MODEL_COST_TABLE["gemini-3-pro"]! },
-  { match: (id) => /gemini.*flash/i.test(id),        cost: MODEL_COST_TABLE["gemini-2.5-flash"]! },
-  { match: (id) => /gemini/i.test(id),               cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
-  { match: (id) => /grok/i.test(id),                 cost: MODEL_COST_TABLE["grok-4.20"]! },
-  { match: (id) => /kimi/i.test(id),                 cost: MODEL_COST_TABLE["kimi-k2.5"]! },
+  { match: (id) => /gemini.*3/i.test(id),             cost: MODEL_COST_TABLE["gemini-3-pro"]! },
+  { match: (id) => /gemini.*flash/i.test(id),         cost: MODEL_COST_TABLE["gemini-2.5-flash"]! },
+  { match: (id) => /gemini/i.test(id),                cost: MODEL_COST_TABLE["gemini-3.1-pro"]! },
+  { match: (id) => /grok-4\.20/i.test(id),        cost: MODEL_COST_TABLE["grok-4.20"]! },
+  { match: (id) => /grok-4\.7-fast/i.test(id),     cost: MODEL_COST_TABLE["grok-4.7-fast"]! },
+  { match: (id) => /grok/i.test(id),               cost: MODEL_COST_TABLE["grok-4.20"]! },
+  { match: (id) => /glm-5\.2/i.test(id),              cost: MODEL_COST_TABLE["glm-5.2"]! },
+  { match: (id) => /kimi-k3/i.test(id),               cost: MODEL_COST_TABLE["kimi-k3"]! },
+  { match: (id) => /kimi.*k2\.7/i.test(id),           cost: MODEL_COST_TABLE["kimi-k2.7-code"]! },
+  { match: (id) => /kimi/i.test(id),                  cost: MODEL_COST_TABLE["kimi-k2.5"]! },
+  { match: (id) => /muse.*spark/i.test(id),           cost: MODEL_COST_TABLE["muse-spark-1.3"]! },
 ];
 
 const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
