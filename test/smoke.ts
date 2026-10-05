@@ -3,7 +3,9 @@ import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentServerMessageSchema,
   GetUsableModelsResponseSchema,
+  InteractionUpdateSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
 import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
@@ -37,10 +39,12 @@ interface TestCursorBackend {
   refreshUrl: string;
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
+  setHoldRunStream: (hold: boolean) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
+  waitForRunStreamClose: () => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -66,6 +70,27 @@ function assertArrayEqual(
   }
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  message: string,
+  timeoutMs = 10_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Timed out after ${timeoutMs}ms waiting for: ${message}`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function makeJwt(expiresAtSeconds: number): string {
   const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = btoa(JSON.stringify({ exp: expiresAtSeconds }));
@@ -80,6 +105,23 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
+/** A Connect-framed text delta, enough to make the proxy emit its first SSE chunk. */
+function frameRunTextDelta(text: string): Buffer {
+  return frameConnectUnaryMessage(
+    toBinary(
+      AgentServerMessageSchema,
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "interactionUpdate",
+          value: create(InteractionUpdateSchema, {
+            message: { case: "textDelta", value: { text } },
+          }),
+        },
+      }),
+    ),
+  );
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -87,6 +129,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   ];
   const discoveryAuthHeaders: string[] = [];
   const discoveryRequestBodies: Uint8Array[] = [];
+  let runStreamClosed = Promise.withResolvers<void>();
+  const heldRunStreams = new Set<http2.ServerHttp2Stream>();
+  let holdRunStream = false;
   const refreshAuthHeaders: string[] = [];
 
   const refreshServer = http.createServer((req, res) => {
@@ -121,11 +166,24 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
+      const closed = runStreamClosed;
       stream.respond({
         ":status": 200,
         "content-type": "application/connect+proto",
       });
-      stream.end();
+      stream.on("close", () => {
+        heldRunStreams.delete(stream);
+        closed.resolve();
+      });
+      if (holdRunStream) {
+        // Cancellation can only be observed on a stream still running when the
+        // client goes away. Bun also withholds SSE response headers until the
+        // first body byte, so emit one to unblock the caller's fetch.
+        heldRunStreams.add(stream);
+        stream.write(frameRunTextDelta("streaming"));
+      } else {
+        stream.end();
+      }
       return;
     }
 
@@ -195,10 +253,20 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setDiscoveredModels(models) {
       discoveredModels = models;
     },
+    setHoldRunStream(hold) {
+      holdRunStream = hold;
+      if (!hold) {
+        for (const stream of heldRunStreams) stream.close();
+      }
+    },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
+      runStreamClosed = Promise.withResolvers<void>();
+    },
+    waitForRunStreamClose() {
+      return runStreamClosed.promise;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
@@ -292,6 +360,49 @@ async function testProxyStartStop(modules: TestModules) {
     throw new Error("Proxy port should be undefined after stop");
   }
   console.log("[test] Proxy stop OK");
+}
+
+async function testStreamCancellationStopsBridge(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing SSE cancellation teardown...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  const controller = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const fetchTimeout = setTimeout(() => controller.abort(), 10_000);
+    let res: Response;
+    try {
+      res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(fetchTimeout);
+    }
+    assertEqual(res.status, 200, "Expected a streaming response");
+
+    controller.abort();
+    // The bridge subprocess holds the only handle on this Run stream, so its
+    // closure proves the subprocess was killed.
+    await withTimeout(
+      backend.waitForRunStreamClose(),
+      "the Cursor Run stream to close after the client disconnects",
+    );
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] SSE cancellation teardown OK");
 }
 
 async function testAuthParams(modules: TestModules) {
@@ -869,6 +980,7 @@ async function main() {
 
   try {
     await testProxyStartStop(modules);
+    await testStreamCancellationStopsBridge(modules, backend);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
