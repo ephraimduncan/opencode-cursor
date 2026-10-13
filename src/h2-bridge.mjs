@@ -80,12 +80,21 @@ async function readMessage() {
 // --- Main ---
 
 const configBuf = await readMessage();
-if (!configBuf) process.exit(1);
+if (!configBuf) {
+  console.error("[bridge] No config received");
+  process.exit(1);
+}
 
 const config = JSON.parse(configBuf.toString("utf8"));
 const { accessToken, url, path: rpcPath, unary } = config;
 
-const client = http2.connect(url || "https://api2.cursor.sh");
+let client;
+try {
+  client = http2.connect(url || "https://api2.cursor.sh");
+} catch (err) {
+  console.error("[bridge] http2.connect threw:", err);
+  process.exit(1);
+}
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
@@ -102,7 +111,8 @@ function killBridge() {
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (err) => {
+  console.error("[bridge] HTTP/2 error:", err);
   clearTimeout(timeout);
   process.exit(1);
 });

@@ -1,4 +1,4 @@
-import { Credential, Integration, Model, Plugin } from "@opencode-ai/plugin";
+import { Credential, Integration, Model, Plugin, PluginOptions } from "@opencode-ai/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -17,15 +17,20 @@ const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
 const CURSOR_METHOD_ID = Integration.MethodID.make("cursor-oauth");
 const OPENAI_COMPATIBLE_PACKAGE =
   "@opencode-ai/ai/providers/openai-compatible";
+const CURSOR_DISABLE_HTTP2 = process.env.CURSOR_DISABLE_HTTP2 === "1";
 
 interface CatalogState {
   readonly models: CursorModel[];
   readonly port: number;
 }
 
+interface CursorPluginOptions extends PluginOptions {
+  disableHttp2?: boolean;
+}
+
 const CursorV2Plugin = Plugin.define({
   id: "opencode.cursor-oauth",
-  setup: async (ctx) => {
+  setup: async (ctx, options?: CursorPluginOptions) => {
     await ctx.integration.transform((draft) => {
       draft.update(CURSOR_ID, (integration) => {
         integration.name = "Cursor";
@@ -71,7 +76,7 @@ const CursorV2Plugin = Plugin.define({
     // Setup batches transforms, so apply OAuth refresh before loading the catalog.
     await ctx.integration.reload();
 
-    let catalog = await loadCatalog(ctx);
+    let catalog = await loadCatalog(ctx, options?.disableHttp2 ?? CURSOR_DISABLE_HTTP2);
     await ctx.catalog.transform((draft) => {
       const current = catalog;
       if (!current) return;
@@ -108,7 +113,7 @@ const CursorV2Plugin = Plugin.define({
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
-      catalog = await loadCatalog(ctx);
+      catalog = await loadCatalog(ctx, options?.disableHttp2 ?? CURSOR_DISABLE_HTTP2);
       if (!catalog) stopProxy();
       await ctx.catalog.reload();
     });
@@ -127,11 +132,12 @@ export default CursorV2Plugin;
 
 async function loadCatalog(
   ctx: Plugin.Context,
+  disableHttp2: boolean,
 ): Promise<CatalogState | undefined> {
   try {
     const accessToken = await getAccessToken(ctx);
-    const models = await getCursorModels(accessToken);
-    const port = await startProxy(() => getAccessToken(ctx), models);
+    const models = await getCursorModels(accessToken, disableHttp2);
+    const port = await startProxy(() => getAccessToken(ctx), models, disableHttp2);
     return { models, port };
   } catch {
     return undefined;

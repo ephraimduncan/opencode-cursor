@@ -1,8 +1,11 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
+  BidiRequestIdSchema,
+  ClientHeartbeatSchema,
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -860,6 +863,155 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+
+async function testBridgeFraming() {
+  console.log("[test] Testing bridge frame format...");
+  
+  const payload = new Uint8Array([1, 2, 3, 4, 5]);
+  const frame = new Uint8Array(4 + payload.length);
+  frame.set(new Uint8Array([
+    (payload.length >> 24) & 0xff,
+    (payload.length >> 16) & 0xff,
+    (payload.length >> 8) & 0xff,
+    payload.length & 0xff,
+  ]));
+  frame.set(payload, 4);
+  
+  if (frame.length !== 9) {
+    throw new Error(`Expected frame length 9, got ${frame.length}`);
+  }
+  const len = (frame[0] << 24) | (frame[1] << 16) | (frame[2] << 8) | frame[3];
+  if (len !== 5) {
+    throw new Error(`Expected length 5, got ${len}`);
+  }
+  for (let i = 0; i < 5; i++) {
+    if (frame[4 + i] !== payload[i]) {
+      throw new Error(`Payload mismatch at index ${i}`);
+    }
+  }
+  
+  console.log("[test] Bridge framing OK");
+}
+
+async function testStreamingFrameParser() {
+  console.log("[test] Testing streaming frame parser...");
+  
+  const frame1 = Buffer.alloc(8);
+  frame1[0] = 0;
+  frame1.writeUInt32BE(3, 1);
+  frame1.set([1, 2, 3], 5);
+  
+  const frame2 = Buffer.alloc(7);
+  frame2[0] = 0;
+  frame2.writeUInt32BE(2, 1);
+  frame2.set([4, 5], 5);
+  
+  const combined = Buffer.concat([frame1, frame2]);
+  
+  const messages: Uint8Array[] = [];
+  let endStreamCalled = false;
+  
+  let pending = Buffer.alloc(0);
+  const parser = (incoming: Buffer) => {
+    pending = Buffer.concat([pending, incoming]);
+    while (pending.length >= 5) {
+      const flags = pending[0]!;
+      const msgLen = pending.readUInt32BE(1);
+      if (pending.length < 5 + msgLen) break;
+      const messageBytes = pending.subarray(5, 5 + msgLen);
+      pending = pending.subarray(5 + msgLen);
+      if (flags & 0b00000010) { endStreamCalled = true; }
+      else { messages.push(new Uint8Array(messageBytes)); }
+    }
+  };
+  
+  parser(combined);
+  
+  if (messages.length !== 2) {
+    throw new Error(`Expected 2 messages, got ${messages.length}`);
+  }
+  if (messages[0]!.length !== 3 || messages[1]!.length !== 2) {
+    throw new Error("Message lengths incorrect");
+  }
+  
+  console.log("[test] Streaming frame parser OK");
+}
+
+function assertBytesEqual(actual: Uint8Array, expected: Uint8Array, message: string): void {
+  if (Buffer.from(actual).equals(Buffer.from(expected))) return;
+  throw new Error(
+    `${message}: expected ${Buffer.from(expected).toString("hex")}, got ${Buffer.from(actual).toString("hex")}`,
+  );
+}
+
+async function testHttp1WireFormat() {
+  console.log("[test] Testing HTTP/1.1 wire format...");
+  const {
+    encodeConnectEnvelope,
+    buildHttp1CursorRequest,
+    encodeBidiAppendRequest,
+    decodeBidiAppendRequest,
+  } = await import("../src/proxy");
+
+  const jsonPayload = new TextEncoder().encode('{"payload":"foo"}');
+  assertEqual(jsonPayload.length, 17, "Expected documented StreamSSE payload length");
+  const envelope = encodeConnectEnvelope(jsonPayload);
+  assertEqual(envelope[0], 0, "Expected connect envelope flags 0");
+  assertEqual(envelope[1], 0, "Expected length byte 1");
+  assertEqual(envelope[2], 0, "Expected length byte 2");
+  assertEqual(envelope[3], 0, "Expected length byte 3");
+  assertEqual(envelope[4], 0x11, "Expected length 17");
+  assertBytesEqual(envelope.subarray(5), jsonPayload, "Expected envelope payload");
+
+  const raw = new Uint8Array([0xff, 0x01]);
+  const unary = buildHttp1CursorRequest(
+    "/agent.v1.AgentService/GetUsableModels",
+    raw,
+    true,
+    "rid-unary",
+  );
+  assertEqual(unary.path, "/agent.v1.AgentService/GetUsableModels", "Expected unary path");
+  assertEqual(unary.headers["Content-Type"], "application/proto", "Expected unary content type");
+  assert(unary.body === raw, "Expected unary body to be the original protobuf bytes");
+  assert(!("x-cursor-streaming" in unary.headers), "Expected unary request without streaming header");
+
+  const heartbeatMessage = create(AgentClientMessageSchema, {
+    message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
+  });
+  const heartbeat = toBinary(AgentClientMessageSchema, heartbeatMessage);
+  const unaryMessage = buildHttp1CursorRequest(
+    "/agent.v1.AgentService/GetUsableModels",
+    heartbeat,
+    true,
+    "rid-unary-msg",
+  );
+  assert(unaryMessage.body === heartbeat, "Expected unary AgentClientMessage bytes unchanged");
+  assert(
+    new TextDecoder().decode(unaryMessage.body) !== JSON.stringify(toJson(AgentClientMessageSchema, heartbeatMessage)),
+    "Expected unary body not to be JSON",
+  );
+  assertEqual(unaryMessage.body.length, heartbeat.length, "Expected no connect envelope on unary");
+
+  const stream = buildHttp1CursorRequest("/agent.v1.AgentService/Run", heartbeat, false, "rid-stream");
+  assertEqual(stream.path, "/agent.v1.AgentService/RunSSE", "Expected RunSSE path");
+  assertEqual(stream.headers["Content-Type"], "application/connect+proto", "Expected streaming content type");
+  assertEqual(stream.headers["x-cursor-streaming"], "true", "Expected streaming header");
+  assertEqual(stream.headers["x-request-id"], "rid-stream", "Expected request id header");
+  assertEqual(stream.body[0], 0, "Expected envelope flags");
+  const requestId = fromBinary(BidiRequestIdSchema, stream.body.subarray(5));
+  assertEqual(requestId.requestId, "rid-stream", "Expected RunSSE body to carry the request id");
+
+  const message = new Uint8Array([1, 2, 3, 255]);
+  const first = decodeBidiAppendRequest(encodeBidiAppendRequest(message, "req-123", 0));
+  assertEqual(first.dataHex, "010203ff", "Expected hex AgentClientMessage");
+  assertEqual(first.requestId, "req-123", "Expected BidiAppend request id");
+  assertEqual(first.appendSeqno, 0, "Expected append seqno 0");
+  const second = decodeBidiAppendRequest(encodeBidiAppendRequest(message, "req-123", 1));
+  assertEqual(second.appendSeqno, 1, "Expected append seqno 1");
+
+  console.log("[test] HTTP/1.1 wire format OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -868,7 +1020,10 @@ async function main() {
   const modules = await loadModules();
 
   try {
+    await testBridgeFraming();
+    await testHttp1WireFormat();
     await testProxyStartStop(modules);
+    await testStreamingFrameParser();
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);

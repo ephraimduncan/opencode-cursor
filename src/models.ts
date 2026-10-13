@@ -1,11 +1,11 @@
 /**
  * Cursor model discovery via GetUsableModels.
- * Uses the H2 bridge for transport. Falls back to a hardcoded list
+ * Transport follows the proxy HTTP mode. Falls back to a hardcoded list
  * when discovery fails.
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
-import { callCursorUnaryRpc } from "./proxy";
+import { callCursor, CURSOR_DISABLE_HTTP2, setProxyDisableHttp2 } from "./proxy";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
@@ -76,22 +76,21 @@ const AUTO_MODEL: CursorModel = {
 
 async function fetchCursorUsableModels(
   apiKey: string,
+  disableHttp2: boolean = CURSOR_DISABLE_HTTP2,
 ): Promise<CursorModel[] | null> {
+  setProxyDisableHttp2(disableHttp2);
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
 
-    const response = await callCursorUnaryRpc({
-      accessToken: apiKey,
-      rpcPath: GET_USABLE_MODELS_PATH,
-      requestBody,
-    });
+    const response = await callCursor(apiKey, GET_USABLE_MODELS_PATH, requestBody, { unary: true, timeoutMs: 10_000 });
 
-    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+    const responseBody = new Uint8Array(await response.arrayBuffer());
+    if (responseBody.length === 0) {
       return null;
     }
 
-    const decoded = decodeGetUsableModelsResponse(response.body);
+    const decoded = decodeGetUsableModelsResponse(responseBody);
     if (!decoded) return null;
 
     const models = normalizeCursorModels(decoded.models);
@@ -105,9 +104,10 @@ let cachedModels: CursorModel[] | null = null;
 
 export async function getCursorModels(
   apiKey: string,
+  disableHttp2: boolean = CURSOR_DISABLE_HTTP2,
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
-  const discovered = await fetchCursorUsableModels(apiKey);
+  const discovered = await fetchCursorUsableModels(apiKey, disableHttp2);
   const models = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
   cachedModels = models.some((m) => m.id === AUTO_MODEL.id) ? models : [AUTO_MODEL, ...models];
   return cachedModels;
