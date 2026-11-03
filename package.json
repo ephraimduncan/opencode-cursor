@@ -51,6 +51,7 @@
   "dependencies": {
     "@bufbuild/protobuf": "^2.0.0",
     "@opencode-ai/plugin": "0.0.0-beta-17793",
+    "@opencode/plugin": "2.0.4",
     "@opencode-ai/sdk": "^1.18.9",
     "zod": "^3.24.0"
   },

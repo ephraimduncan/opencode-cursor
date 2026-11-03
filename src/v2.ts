@@ -1,4 +1,4 @@
-import { Credential, Integration, Model, Plugin } from "@opencode-ai/plugin";
+import { Credential, Integration, Model, Plugin, Provider } from "@opencode/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -16,7 +16,7 @@ const CURSOR_ID = "cursor";
 const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
 const CURSOR_METHOD_ID = Integration.MethodID.make("cursor-oauth");
 const OPENAI_COMPATIBLE_PACKAGE =
-  "@opencode-ai/ai/providers/openai-compatible";
+  "@opencode/ai/providers/openai-compatible";
 
 interface CatalogState {
   readonly models: CursorModel[];
@@ -72,45 +72,48 @@ const CursorV2Plugin = Plugin.define({
     await ctx.integration.reload();
 
     let catalog = await loadCatalog(ctx);
-    await ctx.catalog.transform((draft) => {
+    await ctx.provider.transform((draft) => {
       const current = catalog;
       if (!current) return;
 
-      draft.provider.update(CURSOR_ID, (provider) => {
-        provider.integrationID = CURSOR_INTEGRATION_ID;
-        provider.name = "Cursor";
-        provider.activation = "auto";
-        provider.package = OPENAI_COMPATIBLE_PACKAGE;
-        provider.settings = {
-          ...provider.settings,
-          baseURL: `http://localhost:${current.port}/v1`,
-        };
-      });
-
-      for (const cursorModel of current.models) {
-        draft.model.update(CURSOR_ID, cursorModel.id, (model) => {
-          model.modelID = Model.ID.make(cursorModel.id);
-          model.name = cursorModel.name;
-          model.capabilities = {
+      if (draft.get(CURSOR_ID)) draft.remove(CURSOR_ID);
+      draft.add({
+        info: {
+          id: Provider.ID.make(CURSOR_ID),
+          integrationID: CURSOR_INTEGRATION_ID,
+          name: "Cursor",
+          activation: "auto",
+          package: OPENAI_COMPATIBLE_PACKAGE,
+          settings: { baseURL: `http://localhost:${current.port}/v1` },
+        },
+        models: current.models.map((cursorModel) => ({
+          id: Model.ID.make(cursorModel.id),
+          modelID: Model.ID.make(cursorModel.id),
+          providerID: Provider.ID.make(CURSOR_ID),
+          name: cursorModel.name,
+          capabilities: {
             tools: true,
             input: ["text"],
             output: ["text"],
-          };
-          model.limit = {
+          },
+          variants: [],
+          time: { released: 0 },
+          cost: [],
+          status: "active",
+          enabled: true,
+          limit: {
             context: cursorModel.contextWindow,
             output: cursorModel.maxTokens,
-          };
-          model.status = "active";
-          model.enabled = true;
-        });
-      }
+          },
+        })),
+      });
     });
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
       catalog = await loadCatalog(ctx);
       if (!catalog) stopProxy();
-      await ctx.catalog.reload();
+      await ctx.provider.reload();
     });
 
     return async () => {
@@ -154,18 +157,34 @@ function watchConnections(
   refresh: () => Promise<void>,
 ): () => Promise<void> {
   const events = ctx.event.subscribe()[Symbol.asyncIterator]();
+  let lastAccessToken: string | undefined;
   const watcher = (async () => {
+    lastAccessToken = await getAccessToken(ctx).catch(() => undefined);
     try {
       while (true) {
         const next = await events.next();
         if (next.done) return;
         const event = next.value;
         if (
-          event.type === "integration.connection.updated" &&
-          event.data.integrationID === CURSOR_ID
+          event.type !== "credential.updated" &&
+          !(
+            event.type === "credential.switched" &&
+            event.data.integrationID === CURSOR_ID
+          )
         ) {
-          await refresh().catch(() => {});
+          continue;
         }
+        // credential.updated carries no integration ID, so only reload when
+        // the Cursor access token actually changed (login, logout, refresh).
+        const accessToken = await getAccessToken(ctx).catch(() => undefined);
+        if (
+          event.type === "credential.updated" &&
+          accessToken === lastAccessToken
+        ) {
+          continue;
+        }
+        lastAccessToken = accessToken;
+        await refresh().catch(() => {});
       }
     } catch {}
   })();
