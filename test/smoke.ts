@@ -6,7 +6,7 @@ import {
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
-import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
+import { Credential, Integration, Model, Provider } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
@@ -29,8 +29,8 @@ type IntegrationTransform = Parameters<
 >[0];
 type IntegrationDraft = Parameters<IntegrationTransform>[0];
 type IntegrationMethod = Parameters<IntegrationDraft["method"]["update"]>[0];
-type CatalogTransform = Parameters<V2Context["catalog"]["transform"]>[0];
-type CatalogDraft = Parameters<CatalogTransform>[0];
+type ProviderTransform = Parameters<V2Context["provider"]["transform"]>[0];
+type ProviderDraft = Parameters<ProviderTransform>[0];
 
 interface TestCursorBackend {
   apiUrl: string;
@@ -389,7 +389,7 @@ async function testV2Plugin(
   ]);
 
   let integrationTransform: IntegrationTransform | undefined;
-  let catalogTransform: CatalogTransform | undefined;
+  let providerTransform: ProviderTransform | undefined;
   let authMethod: IntegrationMethod | undefined;
   let integrationName: string | undefined;
   let providerPackage: string | undefined;
@@ -422,42 +422,32 @@ async function testV2Plugin(
     },
   };
 
-  const catalogDraft: CatalogDraft = {
-    provider: {
-      list() {
-        return [];
-      },
-      get() {
-        return undefined;
-      },
-      update(id, update) {
-        const provider = Provider.Info.empty(Provider.ID.make(id));
-        update(provider);
-        providerPackage = provider.package;
-        providerIntegrationID = provider.integrationID;
-        providerBaseURL = provider.settings?.baseURL;
-      },
-      remove() {},
+  let registered: ReturnType<ProviderDraft["list"]>[number] | undefined;
+  const providerDraft: ProviderDraft = {
+    list() {
+      return registered ? [registered] : [];
     },
-    model: {
-      get() {
-        return undefined;
-      },
-      update(providerID, modelID, update) {
-        const model = Model.Info.default(
-          Provider.ID.make(providerID),
-          Model.ID.make(modelID),
-        );
-        update(model);
-        modelIDs.push(model.id);
-      },
+    get(id) {
+      return registered?.provider.id === id ? registered : undefined;
+    },
+    add(input) {
+      registered = {
+        provider: input.info,
+        models: new Map(input.models.map((model) => [model.id, model])),
+      };
+      providerPackage = input.info.package;
+      providerIntegrationID = input.info.integrationID;
+      providerBaseURL = input.info.settings?.baseURL;
+      for (const model of input.models) modelIDs.push(model.id);
+    },
+    update() {},
+    remove() {
+      registered = undefined;
+    },
+    models: {
+      set() {},
+      update() {},
       remove() {},
-      default: {
-        get() {
-          return undefined;
-        },
-        set() {},
-      },
     },
   };
 
@@ -482,10 +472,10 @@ async function testV2Plugin(
     expires: Date.now() - 1,
   });
   const connectionEvent = {
-    id: "cursor-connection-updated",
+    id: "cursor-credential-switched",
     created: Date.now(),
-    type: "integration.connection.updated" as const,
-    data: { integrationID: "cursor" },
+    type: "credential.switched" as const,
+    data: { integrationID: "cursor", credentialID: "cursor-test" },
   };
   let eventClosed = false;
   const eventQueue: Array<typeof connectionEvent> = [];
@@ -557,15 +547,15 @@ async function testV2Plugin(
         },
       },
     },
-    catalog: {
-      async transform(transform: CatalogTransform) {
-        catalogTransform = transform;
+    provider: {
+      async transform(transform: ProviderTransform) {
+        providerTransform = transform;
         return { async dispose() {} };
       },
       async reload() {
         modelIDs.length = 0;
-        assert(catalogTransform, "Expected V2 catalog transform");
-        catalogTransform(catalogDraft);
+        assert(providerTransform, "Expected V2 provider transform");
+        providerTransform(providerDraft);
         markReload?.();
         markReload = undefined;
         if (failReload) {
@@ -581,7 +571,7 @@ async function testV2Plugin(
     },
   };
 
-  // SAFETY: The plugin only reads the integration, catalog, and event domains
+  // SAFETY: The plugin only reads the integration, provider, and event domains
   // supplied by this public-entrypoint harness.
   const cleanup = await modules.CursorV2Plugin.setup(
     context as unknown as V2Context,
@@ -625,7 +615,7 @@ async function testV2Plugin(
   );
   assertEqual(
     providerPackage,
-    "@opencode-ai/ai/providers/openai-compatible",
+    "@opencode/ai/providers/openai-compatible",
     "Expected V2 OpenAI-compatible provider",
   );
   assert(
