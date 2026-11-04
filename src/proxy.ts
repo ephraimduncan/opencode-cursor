@@ -80,6 +80,9 @@ import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
+// How often to send a local SSE keepalive comment while waiting on Cursor.
+// Overridable for tests; keep well under Bun.serve's 255s idleTimeout cap.
+const SSE_KEEPALIVE_MS = Number(process.env.CURSOR_PROXY_KEEPALIVE_MS) || 20_000;
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
@@ -1417,7 +1420,7 @@ function createBridgeStreamResponse(
       const keepaliveTimer = setInterval(() => {
         if (closed) return;
         controller.enqueue(encoder.encode(": keepalive\n\n"));
-      }, 20_000);
+      }, SSE_KEEPALIVE_MS);
 
       const makeChunk = (
         delta: Record<string, unknown>,
