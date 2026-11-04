@@ -87,23 +87,40 @@ const { accessToken, url, path: rpcPath, unary } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
+/**
+ * Report why the bridge is about to die. The parent process (proxy.ts)
+ * pipes our stderr and logs it, so a dead bridge is diagnosable instead of
+ * surfacing as an opaque "connection lost" / ECONNRESET to the caller.
+ */
+function reportFailure(reason) {
+  process.stderr.write(`[h2-bridge] ${reason}\n`);
+}
+
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+let timeout = setTimeout(
+  () => killBridge("no response within 30s of connecting to Cursor"),
+  30_000,
+);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeout = setTimeout(
+    () => killBridge("idle for 120s without any H2 activity from Cursor"),
+    120_000,
+  );
 }
 
-function killBridge() {
+function killBridge(reason) {
   clearTimeout(timeout);
+  reportFailure(reason ?? "killed");
   client.destroy();
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (err) => {
   clearTimeout(timeout);
+  reportFailure(`H2 client error: ${err?.message ?? err}`);
   process.exit(1);
 });
 
@@ -136,8 +153,9 @@ h2Stream.on("end", () => {
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
+h2Stream.on("error", (err) => {
   clearTimeout(timeout);
+  reportFailure(`H2 stream error: ${err?.message ?? err}`);
   client.close();
   process.exit(1);
 });
