@@ -87,23 +87,47 @@ const { accessToken, url, path: rpcPath, unary } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+/**
+ * Report why the bridge is about to die. The parent process (proxy.ts)
+ * pipes our stderr and logs it, so a dead bridge is diagnosable instead of
+ * surfacing as an opaque "connection lost" / ECONNRESET to the caller.
+ */
+function reportFailure(reason) {
+  process.stderr.write(`[h2-bridge] ${reason}\n`);
+}
+
+// Overridable for tests; production defaults are 30s / 120s.
+const CONNECT_TIMEOUT_MS = Number(process.env.CURSOR_BRIDGE_CONNECT_TIMEOUT_MS) || 30_000;
+const IDLE_TIMEOUT_MS = Number(process.env.CURSOR_BRIDGE_IDLE_TIMEOUT_MS) || 120_000;
+
+// Guard against initial connection failure. Reset only on genuine upstream
+// h2 activity (see the h2Stream "data" handler below) so long-running agent
+// conversations (with tool call round-trips) survive, while a connection
+// that Cursor has gone silent on (no response, no RST — a black hole) still
+// gets detected and killed instead of hanging forever.
+let timeout = setTimeout(
+  () => killBridge(`no response within ${CONNECT_TIMEOUT_MS / 1000}s of connecting to Cursor`),
+  CONNECT_TIMEOUT_MS,
+);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeout = setTimeout(
+    () => killBridge(`idle for ${IDLE_TIMEOUT_MS / 1000}s without any H2 activity from Cursor`),
+    IDLE_TIMEOUT_MS,
+  );
 }
 
-function killBridge() {
+function killBridge(reason) {
   clearTimeout(timeout);
+  reportFailure(reason ?? "killed");
   client.destroy();
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (err) => {
   clearTimeout(timeout);
+  reportFailure(`H2 client error: ${err?.message ?? err}`);
   process.exit(1);
 });
 
@@ -136,8 +160,9 @@ h2Stream.on("end", () => {
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
+h2Stream.on("error", (err) => {
   clearTimeout(timeout);
+  reportFailure(`H2 stream error: ${err?.message ?? err}`);
   client.close();
   process.exit(1);
 });
@@ -161,7 +186,14 @@ if (unary) {
         break;
       }
       if (!h2Stream.closed && !h2Stream.destroyed) {
-        resetTimeout();
+        // Note: deliberately NOT calling resetTimeout() here. This loop also
+        // forwards the parent's local keepalive heartbeat (every 5s) — that
+        // only proves *we* are still writing, not that Cursor is still
+        // listening. A silently black-holed connection (packets dropped,
+        // no RST) would otherwise look perpetually "alive" to this timer
+        // forever, since the heartbeat never stops. Only a genuine response
+        // from Cursor (the h2Stream "data" handler below) should prove the
+        // connection is actually alive.
         h2Stream.write(msg);
       }
     }

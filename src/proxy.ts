@@ -80,6 +80,9 @@ import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
+// How often to send a local SSE keepalive comment while waiting on Cursor.
+// Overridable for tests; keep well under Bun.serve's 255s idleTimeout cap.
+const SSE_KEEPALIVE_MS = Number(process.env.CURSOR_PROXY_KEEPALIVE_MS) || 20_000;
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
@@ -304,12 +307,31 @@ function spawnBridge(options: SpawnBridgeOptions): {
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
   get alive(): boolean;
+  /** Last diagnostic line the bridge wrote to stderr before dying, if any. */
+  get lastError(): string | undefined;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    // Piped (not ignored) so a bridge death is diagnosable: h2-bridge.mjs
+    // reports why it's exiting (upstream H2 error, idle timeout, etc.)
+    // instead of the caller only seeing an opaque dropped connection.
+    stderr: "pipe",
   });
+
+  let lastError: string | undefined;
+  void (async () => {
+    try {
+      for await (const chunk of proc.stderr as ReadableStream<Uint8Array>) {
+        const text = Buffer.from(chunk).toString("utf8").trim();
+        if (!text) continue;
+        lastError = text;
+        console.error(`[cursor-bridge pid=${proc.pid}] ${text}`);
+      }
+    } catch {
+      // Stream ended
+    }
+  })();
 
   const config = JSON.stringify({
     accessToken: options.accessToken,
@@ -359,6 +381,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   return {
     proc,
     get alive() { return !exited; },
+    get lastError() { return lastError; },
     write(data) {
       try { proc.stdin.write(lpEncode(data)); } catch {}
     },
@@ -1379,8 +1402,25 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        clearInterval(keepaliveTimer);
         controller.close();
       };
+
+      // Bun's Bun.serve idleTimeout is capped at 255s, but the upstream
+      // bridge->Cursor heartbeat (every 5s) only keeps the bridge<->Cursor
+      // H2 connection warm — it does not emit any byte on *this* local SSE
+      // response when Cursor sends back no frame (e.g. a long silent
+      // "thinking" stretch with no textDelta). Without local traffic, Bun
+      // idle-times out this connection and the caller sees that as a
+      // generic "ECONNRESET: Connection lost while reading the response",
+      // indistinguishable from a real network failure even though nothing
+      // is actually wrong with the connection. A harmless SSE comment line
+      // (ignored by all SSE/OpenAI-SSE consumers) keeps local bytes
+      // flowing so Bun never considers this connection idle.
+      const keepaliveTimer = setInterval(() => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(": keepalive\n\n"));
+      }, SSE_KEEPALIVE_MS);
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -1532,7 +1572,8 @@ function createBridgeStreamResponse(
         } else if (code !== 0) {
           // Bridge died while tool calls are pending (timeout, crash, etc.).
           // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+          const reason = bridge.lastError ? ` (${bridge.lastError})` : "";
+          sendSSE(makeChunk({ content: `\n[Error: bridge connection lost${reason}]` }));
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
