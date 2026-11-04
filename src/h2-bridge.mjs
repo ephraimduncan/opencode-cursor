@@ -96,18 +96,25 @@ function reportFailure(reason) {
   process.stderr.write(`[h2-bridge] ${reason}\n`);
 }
 
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
+// Overridable for tests; production defaults are 30s / 120s.
+const CONNECT_TIMEOUT_MS = Number(process.env.CURSOR_BRIDGE_CONNECT_TIMEOUT_MS) || 30_000;
+const IDLE_TIMEOUT_MS = Number(process.env.CURSOR_BRIDGE_IDLE_TIMEOUT_MS) || 120_000;
+
+// Guard against initial connection failure. Reset only on genuine upstream
+// h2 activity (see the h2Stream "data" handler below) so long-running agent
+// conversations (with tool call round-trips) survive, while a connection
+// that Cursor has gone silent on (no response, no RST — a black hole) still
+// gets detected and killed instead of hanging forever.
 let timeout = setTimeout(
-  () => killBridge("no response within 30s of connecting to Cursor"),
-  30_000,
+  () => killBridge(`no response within ${CONNECT_TIMEOUT_MS / 1000}s of connecting to Cursor`),
+  CONNECT_TIMEOUT_MS,
 );
 
 function resetTimeout() {
   clearTimeout(timeout);
   timeout = setTimeout(
-    () => killBridge("idle for 120s without any H2 activity from Cursor"),
-    120_000,
+    () => killBridge(`idle for ${IDLE_TIMEOUT_MS / 1000}s without any H2 activity from Cursor`),
+    IDLE_TIMEOUT_MS,
   );
 }
 
@@ -179,7 +186,14 @@ if (unary) {
         break;
       }
       if (!h2Stream.closed && !h2Stream.destroyed) {
-        resetTimeout();
+        // Note: deliberately NOT calling resetTimeout() here. This loop also
+        // forwards the parent's local keepalive heartbeat (every 5s) — that
+        // only proves *we* are still writing, not that Cursor is still
+        // listening. A silently black-holed connection (packets dropped,
+        // no RST) would otherwise look perpetually "alive" to this timer
+        // forever, since the heartbeat never stops. Only a genuine response
+        // from Cursor (the h2Stream "data" handler below) should prove the
+        // connection is actually alive.
         h2Stream.write(msg);
       }
     }
