@@ -860,6 +860,64 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testNativeRedirectSchemas() {
+  console.log("[test] Testing native redirect against v1/v2 tool schemas...");
+  const { redirectNativeExec } = await import("../src/native-tools");
+  const { ExecServerMessageSchema, McpToolDefinitionSchema } = await import("../src/proto/agent_pb");
+  const { ValueSchema } = await import("@bufbuild/protobuf/wkt");
+  const { fromJson } = await import("@bufbuild/protobuf");
+
+  const tool = (name: string, properties: string[]) =>
+    create(McpToolDefinitionSchema, {
+      name,
+      toolName: name,
+      providerIdentifier: "opencode",
+      inputSchema: toBinary(
+        ValueSchema,
+        fromJson(ValueSchema, {
+          type: "object",
+          properties: Object.fromEntries(properties.map((p) => [p, { type: "string" }])),
+          additionalProperties: false,
+        }),
+      ),
+    });
+  const exec = (message: any) => create(ExecServerMessageSchema, { id: 1, message });
+
+  // OpenCode v2: `shell` (no description) and `path`-based read/write.
+  const v2 = [tool("shell", ["command", "workdir", "timeout"]), tool("read", ["path"]), tool("write", ["path", "content"])];
+  const shell = redirectNativeExec(
+    exec({ case: "shellStreamArgs", value: { command: "echo hi", workingDirectory: "/tmp" } }),
+    v2,
+  );
+  assert(shell?.toolName === "shell", "v2: shell command should redirect to the shell tool");
+  assert(
+    JSON.stringify(JSON.parse(shell!.decodedArgs)) === JSON.stringify({ command: "echo hi", workdir: "/tmp" }),
+    `v2: shell args should be limited to the declared schema, got ${shell?.decodedArgs}`,
+  );
+  const read = redirectNativeExec(exec({ case: "readArgs", value: { path: "/a/b" } }), v2);
+  assert(JSON.stringify(JSON.parse(read!.decodedArgs)) === JSON.stringify({ path: "/a/b" }), "v2: read should use path");
+  const write = redirectNativeExec(exec({ case: "writeArgs", value: { path: "/a/b", fileText: "x" } }), v2);
+  const writeArgs = JSON.parse(write!.decodedArgs);
+  assert(
+    writeArgs.path === "/a/b" && writeArgs.content === "x" && !("filePath" in writeArgs),
+    "v2: write should use path",
+  );
+
+  // OpenCode v1: `bash` with description, `filePath`-based read.
+  const v1 = [tool("bash", ["command", "description", "workdir"]), tool("read", ["filePath"])];
+  const bash = redirectNativeExec(exec({ case: "shellArgs", value: { command: "ls" } }), v1);
+  assert(bash?.toolName === "bash", "v1: shell command should redirect to bash");
+  assert(JSON.parse(bash!.decodedArgs).description === "Runs shell command", "v1: bash keeps description");
+  const read1 = redirectNativeExec(exec({ case: "readArgs", value: { path: "/a/b" } }), v1);
+  assert(JSON.parse(read1!.decodedArgs).filePath === "/a/b", "v1: read keeps filePath");
+
+  assert(
+    redirectNativeExec(exec({ case: "shellArgs", value: { command: "ls" } }), [tool("read", ["path"])]) === null,
+    "no shell-like tool should not redirect",
+  );
+  console.log("[test] Native redirect schemas OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -875,6 +933,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testNativeRedirectSchemas();
     await testV2Plugin(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
