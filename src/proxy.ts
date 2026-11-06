@@ -74,7 +74,7 @@ import {
   type NativeExecBinding,
 } from "./native-tools";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
@@ -1166,6 +1166,28 @@ function handleExecMessage(
     return;
   }
 
+  // Exec types newer than the bundled agent_pb schema arrive with case
+  // undefined and the payload in $unknown. Cursor blocks until each one is
+  // answered, so ignoring them hangs the whole turn.
+  const unknownExec =
+    execCase === undefined
+      ? (execMsg.$unknown ?? []).find((u) => u.wireType === 2 && u.no !== 55)
+      : undefined;
+  if (unknownExec) {
+    if (unknownExec.no === MCP_STATE_FIELD) {
+      sendUnknownExecResult(execMsg, MCP_STATE_FIELD, buildMcpStateResult(mcpTools), sendFrame);
+    } else {
+      console.error(`[proxy] unsupported exec field ${unknownExec.no}; replying rejected`);
+      sendUnknownExecResult(
+        execMsg,
+        unknownExec.no,
+        pbField(3, pbString(1, "Tool not available in this environment.")),
+        sendFrame,
+      );
+    }
+    return;
+  }
+
   // --- Native Cursor tools ---
   // The model tries these before the MCP tools. When the client provides an
   // equivalent tool, redirect the call to it; otherwise reject so the model
@@ -1297,6 +1319,79 @@ function handleExecMessage(
   console.error(`[proxy] unhandled exec: ${execCase}`);
 }
 
+// --- Hand-encoded replies for exec types missing from the bundled schema ---
+
+// ExecServerMessage.mcp_state_exec_args / ExecClientMessage.mcp_state_exec_result
+const MCP_STATE_FIELD = 36;
+const pbEncoder = new TextEncoder();
+
+function pbVarint(n: number): Uint8Array {
+  const out: number[] = [];
+  while (n > 127) {
+    out.push((n & 127) | 128);
+    n >>>= 7;
+  }
+  out.push(n);
+  return Uint8Array.from(out);
+}
+
+function pbConcat(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+function pbField(no: number, bytes: Uint8Array): Uint8Array {
+  return pbConcat(pbVarint((no << 3) | 2), pbVarint(bytes.length), bytes);
+}
+
+function pbString(no: number, value: string): Uint8Array {
+  return pbField(no, pbEncoder.encode(value));
+}
+
+/**
+ * McpStateExecResult { success: McpStateSuccess { servers: [McpStateServer] } }
+ * Describes the MCP server ("opencode") that carries the client's tools so
+ * Cursor can resolve deferred tool schemas.
+ */
+function buildMcpStateResult(mcpTools: McpToolDefinition[]): Uint8Array {
+  const servers: Uint8Array[] = [];
+  if (mcpTools.length > 0) {
+    const server = pbConcat(
+      pbString(1, "opencode"),
+      pbString(2, "opencode"),
+      ...mcpTools.map((t) => pbField(5, toBinary(McpToolDefinitionSchema, t))),
+      pbString(7, "connected"),
+    );
+    servers.push(pbField(1, server));
+  }
+  return pbField(1, pbConcat(...servers));
+}
+
+function sendUnknownExecResult(
+  execMsg: ExecServerMessage,
+  fieldNo: number,
+  payload: Uint8Array,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const execClientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  // protobuf-es keeps the length prefix inside UnknownField.data.
+  execClientMessage.$unknown = [
+    { no: fieldNo, wireType: 2, data: pbConcat(pbVarint(payload.length), payload) },
+  ];
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: execClientMessage },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+}
+
 /** Send an exec client message back to Cursor. */
 function sendExecResult(
   execMsg: ExecServerMessage,
@@ -1379,6 +1474,7 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        clearInterval(stallTimer);
         controller.close();
       };
 
@@ -1415,6 +1511,37 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
 
+      // Stall watchdog. Cursor can keep the H2 stream open (so the bridge's idle
+      // timer keeps resetting) while producing nothing, and the client would wait
+      // forever. End such turns with an explicit error and record which frames
+      // arrived so the cause can be diagnosed. Text, thinking and tool calls count
+      // as progress. Override with CURSOR_PROXY_STALL_MS.
+      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 240_000;
+      let lastProgressAt = Date.now();
+      const frameCounts: Record<string, number> = {};
+      const stallTimer = setInterval(() => {
+        if (closed || Date.now() - lastProgressAt < stallMs) return;
+        clearInterval(stallTimer);
+        const secs = Math.round(stallMs / 1000);
+        const summary = JSON.stringify(frameCounts);
+        const line = `[cursor-oauth] stall: no output from Cursor for ${secs}s model=${modelId} frames=${summary}`;
+        console.error(line);
+        appendFile(
+          pathResolve(homedir(), ".cache", "opencode-cursor", "stall.log"),
+          `${new Date().toISOString()} ${line}\n`,
+        ).catch(() => {});
+        sendSSE(makeChunk({
+          content: `\n[Error: Cursor stopped responding (no output for ${secs}s). Retry the message. Frames received: ${summary}]`,
+        }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        activeBridges.delete(bridgeKey);
+        clearInterval(heartbeatTimer);
+        bridge.end();
+      }, 5_000);
+
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -1422,6 +1549,16 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            {
+              const m = serverMessage.message;
+              const detail =
+                m.case === "execServerMessage"
+                  ? `exec:${m.value.message.case ?? "unknown"}`
+                  : m.case === "interactionUpdate"
+                    ? `interaction:${m.value.message?.case ?? "unknown"}`
+                    : (m.case ?? "unknown");
+              frameCounts[detail] = (frameCounts[detail] ?? 0) + 1;
+            }
             processServerMessage(
               serverMessage,
               blobStore,
@@ -1430,6 +1567,7 @@ function createBridgeStreamResponse(
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
+                lastProgressAt = Date.now();
                 if (isThinking) {
                   sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
@@ -1440,6 +1578,7 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                lastProgressAt = Date.now();
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
