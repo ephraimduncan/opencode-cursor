@@ -8,7 +8,8 @@
  * OpenAI tool, redirect the native call to it and convert the tool result
  * back into Cursor's typed native result frame.
  */
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
+import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
   ExecClientMessageSchema,
@@ -75,6 +76,54 @@ export function redirectNativeExec(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
 ): NativeRedirect | null {
+  return fitArgsToSchema(redirectNativeExecRaw(execMsg, mcpTools), mcpTools);
+}
+
+function toolPropertyNames(tool: McpToolDefinition): Set<string> | undefined {
+  try {
+    const schema = toJson(ValueSchema, fromBinary(ValueSchema, tool.inputSchema)) as {
+      properties?: Record<string, unknown>;
+    } | null;
+    if (schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object") {
+      return new Set(Object.keys(schema.properties));
+    }
+  } catch {}
+  return undefined;
+}
+
+/**
+ * Fit redirected arguments to the target tool's declared schema. Client tool
+ * schemas differ between OpenCode versions (v1 read/write take `filePath`, v2
+ * takes `path`; the v2 shell tool has no `description` and rejects extra keys).
+ */
+function fitArgsToSchema(
+  redirect: NativeRedirect | null,
+  mcpTools: McpToolDefinition[],
+): NativeRedirect | null {
+  if (!redirect) return redirect;
+  const tool = mcpTools.find((t) => (t.name || t.toolName) === redirect.toolName);
+  const props = tool ? toolPropertyNames(tool) : undefined;
+  if (!props) return redirect;
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(redirect.decodedArgs);
+  } catch {
+    return redirect;
+  }
+  if (args.filePath !== undefined && !props.has("filePath") && props.has("path")) {
+    args.path = args.filePath;
+    delete args.filePath;
+  }
+  for (const key of Object.keys(args)) {
+    if (!props.has(key)) delete args[key];
+  }
+  return { ...redirect, decodedArgs: JSON.stringify(args) };
+}
+
+function redirectNativeExecRaw(
+  execMsg: ExecServerMessage,
+  mcpTools: McpToolDefinition[],
+): NativeRedirect | null {
   const execCase = execMsg.message.case;
   const available = new Set(
     mcpTools.map((tool) => tool.name || tool.toolName).filter(Boolean),
@@ -131,7 +180,7 @@ export function redirectNativeExec(
 
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const toolName = pick(["bash"]);
+    const toolName = pick(["bash", "shell"]);
     if (!toolName) return null;
     const decodedArgs: Record<string, unknown> = {
       command: args.command ?? "",
