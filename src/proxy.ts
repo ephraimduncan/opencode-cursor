@@ -74,7 +74,7 @@ import {
   type NativeExecBinding,
 } from "./native-tools";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
@@ -1474,6 +1474,7 @@ function createBridgeStreamResponse(
       const closeController = () => {
         if (closed) return;
         closed = true;
+        clearInterval(stallTimer);
         controller.close();
       };
 
@@ -1510,6 +1511,37 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
 
+      // Stall watchdog. Cursor can keep the H2 stream open (so the bridge's idle
+      // timer keeps resetting) while producing nothing, and the client would wait
+      // forever. End such turns with an explicit error and record which frames
+      // arrived so the cause can be diagnosed. Text, thinking and tool calls count
+      // as progress. Override with CURSOR_PROXY_STALL_MS.
+      const stallMs = Number(process.env.CURSOR_PROXY_STALL_MS) || 240_000;
+      let lastProgressAt = Date.now();
+      const frameCounts: Record<string, number> = {};
+      const stallTimer = setInterval(() => {
+        if (closed || Date.now() - lastProgressAt < stallMs) return;
+        clearInterval(stallTimer);
+        const secs = Math.round(stallMs / 1000);
+        const summary = JSON.stringify(frameCounts);
+        const line = `[cursor-oauth] stall: no output from Cursor for ${secs}s model=${modelId} frames=${summary}`;
+        console.error(line);
+        appendFile(
+          pathResolve(homedir(), ".cache", "opencode-cursor", "stall.log"),
+          `${new Date().toISOString()} ${line}\n`,
+        ).catch(() => {});
+        sendSSE(makeChunk({
+          content: `\n[Error: Cursor stopped responding (no output for ${secs}s). Retry the message. Frames received: ${summary}]`,
+        }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        activeBridges.delete(bridgeKey);
+        clearInterval(heartbeatTimer);
+        bridge.end();
+      }, 5_000);
+
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -1517,6 +1549,16 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            {
+              const m = serverMessage.message;
+              const detail =
+                m.case === "execServerMessage"
+                  ? `exec:${m.value.message.case ?? "unknown"}`
+                  : m.case === "interactionUpdate"
+                    ? `interaction:${m.value.message?.case ?? "unknown"}`
+                    : (m.case ?? "unknown");
+              frameCounts[detail] = (frameCounts[detail] ?? 0) + 1;
+            }
             processServerMessage(
               serverMessage,
               blobStore,
@@ -1525,6 +1567,7 @@ function createBridgeStreamResponse(
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
+                lastProgressAt = Date.now();
                 if (isThinking) {
                   sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
@@ -1535,6 +1578,7 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                lastProgressAt = Date.now();
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
